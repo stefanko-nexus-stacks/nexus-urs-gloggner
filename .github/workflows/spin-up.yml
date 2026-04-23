@@ -1,0 +1,855 @@
+name: Spin Up Nexus-Stack
+
+on:
+  workflow_dispatch:
+    inputs:
+      enabled_services:
+        description: 'Comma-separated list of services to enable (empty = use D1 state)'
+        required: false
+        default: ''
+        type: string
+      silent_mode:
+        description: 'Suppress all automated emails for this run (persists in D1 until reset via toggle-silent-mode workflow)'
+        required: false
+        default: false
+        type: boolean
+  workflow_call:
+    inputs:
+      enabled_services:
+        description: 'Comma-separated list of services to enable (passed by Control Plane from D1)'
+        required: false
+        default: ''
+        type: string
+      silent_mode:
+        description: 'Suppress all automated emails (passed from initial-setup)'
+        required: false
+        default: false
+        type: boolean
+      r2_access_key_id:
+        description: 'R2 Access Key ID (from setup-control-plane)'
+        required: false
+        type: string
+      r2_secret_access_key:
+        description: 'R2 Secret Access Key (from setup-control-plane)'
+        required: false
+        type: string
+      r2_data_access_key:
+        description: 'R2 Data Bucket Access Key (from setup-control-plane)'
+        required: false
+        type: string
+      r2_data_secret_key:
+        description: 'R2 Data Bucket Secret Key (from setup-control-plane)'
+        required: false
+        type: string
+      r2_data_bucket:
+        description: 'R2 Data Bucket Name (from setup-control-plane)'
+        required: false
+        type: string
+      ssh_pubkey:
+        description: 'SSH Public Key (from setup-control-plane)'
+        required: false
+        type: string
+      ssh_private_key:
+        description: 'SSH Private Key (from setup-control-plane, for initial setup)'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+# NOTE: No concurrency here - handled by calling workflow (initial-setup.yaml)
+# When called directly via workflow_dispatch, runs without concurrency lock
+
+jobs:
+  spin-up:
+    name: Spin Up Nexus-Stack
+    runs-on: ubuntu-latest
+    env:
+      TF_VAR_cloudflare_api_token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      TF_VAR_cloudflare_account_id: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      TF_VAR_cloudflare_zone_id: ${{ secrets.CLOUDFLARE_ZONE_ID }}
+      TF_VAR_hcloud_token: ${{ secrets.HCLOUD_TOKEN }}
+      TF_VAR_domain: ${{ secrets.DOMAIN }}
+      TF_VAR_access_emails: ${{ secrets.ACCESS_EMAILS }}
+      TF_VAR_infisical_token: ${{ secrets.INFISICAL_TOKEN }}
+      TF_VAR_dockerhub_username: ${{ secrets.DOCKERHUB_USERNAME }}
+      TF_VAR_dockerhub_token: ${{ secrets.DOCKERHUB_TOKEN }}
+      TF_VAR_github_owner: ${{ github.repository_owner }}
+      TF_VAR_github_repo: ${{ github.event.repository.name }}
+      # Hetzner Object Storage (for LakeFS) - credentials are secrets
+      TF_VAR_hetzner_object_storage_access_key: ${{ secrets.HETZNER_OBJECT_STORAGE_ACCESS_KEY }}
+      TF_VAR_hetzner_object_storage_secret_key: ${{ secrets.HETZNER_OBJECT_STORAGE_SECRET_KEY }}
+      # External S3 Storage (optional - for Filestash multi-backend)
+      TF_VAR_external_s3_endpoint: ${{ secrets.EXTERNAL_S3_ENDPOINT }}
+      TF_VAR_external_s3_region: ${{ secrets.EXTERNAL_S3_REGION || 'auto' }}
+      TF_VAR_external_s3_access_key: ${{ secrets.EXTERNAL_S3_ACCESS_KEY }}
+      TF_VAR_external_s3_secret_key: ${{ secrets.EXTERNAL_S3_SECRET_KEY }}
+      TF_VAR_external_s3_bucket: ${{ secrets.EXTERNAL_S3_BUCKET }}
+      TF_VAR_external_s3_label: ${{ secrets.EXTERNAL_S3_LABEL }}
+      # R2 Datalake (auto-created during setup, inputs override secrets for first-run)
+      TF_VAR_r2_data_access_key: ${{ inputs.r2_data_access_key || secrets.R2_DATA_ACCESS_KEY_ID || secrets.R2_ACCESS_KEY_ID }}
+      TF_VAR_r2_data_secret_key: ${{ inputs.r2_data_secret_key || secrets.R2_DATA_SECRET_ACCESS_KEY || secrets.R2_SECRET_ACCESS_KEY }}
+      TF_VAR_r2_data_bucket: ${{ inputs.r2_data_bucket || secrets.R2_DATA_BUCKET }}
+
+    steps:
+      - name: Mask R2 data credentials from inputs
+        if: inputs.r2_data_access_key != ''
+        run: |
+          echo "::add-mask::${{ inputs.r2_data_access_key }}"
+          echo "::add-mask::${{ inputs.r2_data_secret_key }}"
+          echo "::add-mask::${{ inputs.r2_data_bucket }}"
+
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+
+      - name: Log workflow start
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          DOMAIN: ${{ secrets.DOMAIN }}
+        run: |
+          if [ -f .github/scripts/log-to-d1.sh ]; then
+            chmod +x .github/scripts/log-to-d1.sh
+            .github/scripts/log-to-d1.sh info "Spin-up workflow started"
+          fi
+
+      - name: Install OpenTofu
+        uses: opentofu/setup-opentofu@v2
+        with:
+          tofu_version: 1.10.0
+
+      - name: Install cloudflared
+        run: |
+          curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
+          chmod +x cloudflared
+          sudo mv cloudflared /usr/local/bin/
+
+      - name: Setup SSH key for server access
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+
+          # Ensure newly created key files are never group/world-readable
+          umask 077
+
+          # Get private key: 1) secrets (subsequent runs), 2) workflow input (initial setup)
+          if [ -n "${{ secrets.SSH_PRIVATE_KEY }}" ]; then
+            echo "🔑 Using SSH key from GitHub Secrets"
+            # SSH key heredocs: expression placeholders must NOT start at column 0
+            # (breaks GitHub Actions YAML parser). Keep indented and strip leading
+            # whitespace with sed to ensure clean key content.
+            sed 's/^[[:space:]]*//' > ~/.ssh/id_ed25519 <<'EOF_PRIVATE_KEY'
+          ${{ secrets.SSH_PRIVATE_KEY }}
+          EOF_PRIVATE_KEY
+          elif [ -n "${{ inputs.ssh_private_key }}" ]; then
+            echo "🔑 Using SSH key from workflow input (initial setup)"
+            # Mask each line of the private key to prevent log exposure
+            while IFS= read -r line; do
+              echo "::add-mask::$line"
+            done <<'EOF_MASK'
+          ${{ inputs.ssh_private_key }}
+          EOF_MASK
+            sed 's/^[[:space:]]*//' > ~/.ssh/id_ed25519 <<'EOF_PRIVATE_KEY'
+          ${{ inputs.ssh_private_key }}
+          EOF_PRIVATE_KEY
+          else
+            echo "❌ No SSH key found!"
+            echo "   Please run the 'Initial Setup' workflow (initial-setup.yaml) first to generate SSH keys."
+            exit 1
+          fi
+
+          # Ensure correct permissions (umask handles creation, this is a safety net)
+          chmod 600 ~/.ssh/id_ed25519
+
+          # Get public key: secrets, inputs, or derive from private key
+          if [ -n "${{ secrets.SSH_PUBLIC_KEY }}" ]; then
+            echo "${{ secrets.SSH_PUBLIC_KEY }}" > ~/.ssh/id_ed25519.pub
+          elif [ -n "${{ inputs.ssh_pubkey }}" ]; then
+            echo "${{ inputs.ssh_pubkey }}" > ~/.ssh/id_ed25519.pub
+          else
+            echo "ℹ️ Deriving public key from private key..."
+            ssh-keygen -y -f ~/.ssh/id_ed25519 > ~/.ssh/id_ed25519.pub
+          fi
+          chmod 644 ~/.ssh/id_ed25519.pub
+          echo "✅ SSH key configured"
+
+      - name: Create R2 credentials from secrets
+        run: |
+          mkdir -p tofu
+          
+          # Use inputs from setup-control-plane if available, otherwise fall back to secrets
+          # This allows initial-setup.yaml to pass freshly created credentials
+          if [ -n "${{ inputs.r2_access_key_id }}" ] && [ -n "${{ inputs.r2_secret_access_key }}" ]; then
+            echo "📦 Using R2 credentials from setup-control-plane workflow"
+            R2_ACCESS_KEY_ID="${{ inputs.r2_access_key_id }}"
+            R2_SECRET_ACCESS_KEY="${{ inputs.r2_secret_access_key }}"
+            # Mask credentials passed via workflow inputs (security)
+            echo "::add-mask::$R2_ACCESS_KEY_ID"
+            echo "::add-mask::$R2_SECRET_ACCESS_KEY"
+          else
+            echo "📦 Using R2 credentials from GitHub Secrets"
+            # Trim whitespace and newlines from secrets to avoid auth issues
+            R2_ACCESS_KEY_ID=$(echo -n "${{ secrets.R2_ACCESS_KEY_ID }}" | tr -d '[:space:]')
+            R2_SECRET_ACCESS_KEY=$(echo -n "${{ secrets.R2_SECRET_ACCESS_KEY }}" | tr -d '[:space:]')
+            
+            # Debug: Check if secrets are available (without exposing values)
+            if [ -z "$R2_ACCESS_KEY_ID" ] || [ -z "$R2_SECRET_ACCESS_KEY" ]; then
+              echo "⚠️  R2 credentials from secrets are empty"
+              echo "   R2_ACCESS_KEY_ID length: ${#R2_ACCESS_KEY_ID}"
+              echo "   R2_SECRET_ACCESS_KEY length: ${#R2_SECRET_ACCESS_KEY}"
+              echo ""
+              echo "   This might happen if:"
+              echo "   1. The 'Initial Setup' workflow hasn't been run yet"
+              echo "   2. The secrets weren't saved properly in setup-control-plane"
+              echo "   3. The secrets are in a different repository scope"
+              echo ""
+              echo "   Please run the 'Initial Setup' workflow (initial-setup.yaml) first,"
+              echo "   or manually set R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY in GitHub Settings → Secrets → Actions."
+            fi
+          fi
+          
+          # Validate credentials are not empty
+          if [ -z "$R2_ACCESS_KEY_ID" ] || [ -z "$R2_SECRET_ACCESS_KEY" ]; then
+            echo "❌ R2 credentials are empty!"
+            echo "   Either run the 'Initial Setup' workflow (initial-setup.yaml) first,"
+            echo "   or set R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY in GitHub Settings → Secrets → Actions."
+            exit 1
+          fi
+          
+          # Generate dynamic bucket name from domain
+          BUCKET_NAME=$(echo "${{ secrets.DOMAIN }}" | tr '.' '-')-terraform-state
+          echo "📦 Using bucket: $BUCKET_NAME"
+          
+          cat > tofu/.r2-credentials << EOF
+          R2_ACCESS_KEY_ID="${R2_ACCESS_KEY_ID}"
+          R2_SECRET_ACCESS_KEY="${R2_SECRET_ACCESS_KEY}"
+          EOF
+          sed -i 's/^          //' tofu/.r2-credentials
+
+          cat > tofu/backend.hcl << EOF
+          endpoints = {
+            s3 = "https://${{ secrets.CLOUDFLARE_ACCOUNT_ID }}.r2.cloudflarestorage.com"
+          }
+          bucket = "${BUCKET_NAME}"
+          EOF
+          sed -i 's/^          //' tofu/backend.hcl
+          
+          echo "✅ R2 credentials file created"
+
+      - name: Generate config.tfvars
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          DOMAIN: ${{ secrets.DOMAIN }}
+        run: |
+          # Stack config (emails from secrets)
+          cat > tofu/stack/config.tfvars << EOF
+          server_type     = "cax31"
+          server_location = "${{ vars.SERVER_LOCATION || 'fsn1' }}"
+          server_image    = "ubuntu-24.04"
+
+          ssh_public_key_path  = "~/.ssh/id_ed25519.pub"
+          ssh_private_key_path = "~/.ssh/id_ed25519"
+
+          domain         = "${{ secrets.DOMAIN }}"
+          admin_email    = "${{ secrets.TF_VAR_admin_email }}"
+          user_email     = "${{ secrets.TF_VAR_user_email }}"
+          admin_username = "admin"
+          github_owner   = "${{ github.repository_owner }}"
+          github_repo    = "${{ github.event.repository.name }}"
+          EOF
+          sed -i 's/^          //' tofu/stack/config.tfvars
+          
+          # Add Docker Hub credentials if provided (optional)
+          if [ -n "${{ secrets.DOCKERHUB_USERNAME }}" ] && [ -n "${{ secrets.DOCKERHUB_TOKEN }}" ]; then
+            cat >> tofu/stack/config.tfvars << EOF
+          dockerhub_username = "${{ secrets.DOCKERHUB_USERNAME }}"
+          dockerhub_token    = "${{ secrets.DOCKERHUB_TOKEN }}"
+          EOF
+            sed -i 's/^          //' tofu/stack/config.tfvars
+          fi
+
+          # Get Hetzner Object Storage config from control-plane output
+          cd tofu/control-plane
+          source ../.r2-credentials
+          export AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID"
+          export AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
+          tofu init -backend-config=../backend.hcl >/dev/null 2>&1 || true
+          HETZNER_S3_SERVER=$(tofu output -raw hetzner_s3_server 2>/dev/null || echo "${{ secrets.HETZNER_OBJECT_STORAGE_SERVER || format('{0}.your-objectstorage.com', vars.HETZNER_S3_LOCATION || 'fsn1') }}")
+          HETZNER_S3_REGION=$(tofu output -raw hetzner_s3_region 2>/dev/null || echo "${{ vars.HETZNER_S3_LOCATION || 'fsn1' }}")
+          HETZNER_S3_BUCKET=$(tofu output -raw hetzner_s3_bucket 2>/dev/null || echo "")
+          HETZNER_S3_BUCKET_GENERAL=$(tofu output -raw hetzner_s3_bucket_general 2>/dev/null || echo "")
+          HETZNER_S3_BUCKET_PGDUCKLAKE=$(tofu output -raw hetzner_s3_bucket_pgducklake 2>/dev/null || echo "")
+          PERSISTENT_VOLUME_ID=$(tofu output -raw persistent_volume_id 2>/dev/null || echo "0")
+          # Validate ID is numeric (tofu wrapper may write ::error:: to stdout)
+          if [[ ! "$PERSISTENT_VOLUME_ID" =~ ^[0-9]+$ ]]; then
+            PERSISTENT_VOLUME_ID="0"
+          fi
+          cd ../..
+
+          # Add Hetzner Object Storage config to stack
+          cat >> tofu/stack/config.tfvars << EOF
+          hetzner_object_storage_server = "$HETZNER_S3_SERVER"
+          hetzner_object_storage_region = "$HETZNER_S3_REGION"
+          hetzner_s3_bucket             = "$HETZNER_S3_BUCKET"
+          hetzner_s3_bucket_general     = "$HETZNER_S3_BUCKET_GENERAL"
+          hetzner_s3_bucket_pgducklake  = "$HETZNER_S3_BUCKET_PGDUCKLAKE"
+          persistent_volume_id          = $PERSISTENT_VOLUME_ID
+          EOF
+          sed -i 's/^          //' tofu/stack/config.tfvars
+
+          if [ -n "$HETZNER_S3_BUCKET" ]; then
+            echo "📦 Hetzner Object Storage configured (bucket: $HETZNER_S3_BUCKET)"
+          else
+            echo "⚠️  Hetzner Object Storage not configured (LakeFS will need manual setup)"
+          fi
+
+          if [ "$PERSISTENT_VOLUME_ID" != "0" ]; then
+            echo "💾 Persistent volume configured (ID: $PERSISTENT_VOLUME_ID)"
+          fi
+          
+          # Generate services config from D1 (single source of truth)
+          # If enabled_services input is provided (from Control Plane), use it
+          # Otherwise, read from D1 database
+          ENABLED_SERVICES="${{ inputs.enabled_services }}"
+          
+          if [ -n "$ENABLED_SERVICES" ]; then
+            echo "📋 Using services from Control Plane: $ENABLED_SERVICES"
+          else
+            echo "📋 Reading services from D1 database..."
+            # Get enabled services from D1
+            D1_DATABASE_NAME="nexus-${DOMAIN//./-}-db"
+            ENABLED_SERVICES=$(npx wrangler@4 d1 execute "$D1_DATABASE_NAME" --remote --json \
+              --command "SELECT name FROM services WHERE enabled = 1" 2>/dev/null \
+              | jq -r '.[0].results | map(.name) | join(",")' 2>/dev/null || echo "")
+            
+            if [ -n "$ENABLED_SERVICES" ]; then
+              echo "📋 Enabled services from D1: $ENABLED_SERVICES"
+            else
+              echo "📋 No services in D1 yet - core services will be enabled by default"
+            fi
+          fi
+          
+          # Sync firewall rules from services.yaml to D1 BEFORE reading them
+          # This ensures dns_record and label changes are applied before Tofu reads them
+          D1_DATABASE_NAME="nexus-${DOMAIN//./-}-db"
+          echo "🔥 Syncing firewall rules from services.yaml to D1..."
+          chmod +x .github/scripts/sync-firewall-rules.sh
+          if ! CLOUDFLARE_API_TOKEN="${{ secrets.CLOUDFLARE_API_TOKEN }}" \
+            CLOUDFLARE_ACCOUNT_ID="${{ secrets.CLOUDFLARE_ACCOUNT_ID }}" \
+            DOMAIN="${{ secrets.DOMAIN }}" \
+            bash .github/scripts/sync-firewall-rules.sh; then
+            echo "❌ Firewall rule sync failed — aborting to avoid stale firewall metadata"
+            exit 1
+          fi
+
+          # Read enabled firewall rules from D1
+          echo "🔥 Reading firewall rules from D1..."
+          FIREWALL_RULES=$(npx wrangler@4 d1 execute "$D1_DATABASE_NAME" --remote --json \
+            --command "SELECT service_name, port, source_ips, dns_record FROM firewall_rules WHERE enabled = 1" 2>/dev/null \
+            | jq -r '.[0].results // [] | map("\(.service_name):\(.port):\(.source_ips // ""):\(.dns_record // "")") | join(";")' 2>/dev/null || echo "")
+
+          if [ -n "$FIREWALL_RULES" ]; then
+            echo "🔥 Enabled firewall rules: $FIREWALL_RULES"
+          else
+            echo "🔥 No firewall rules enabled (Zero Entry mode)"
+          fi
+
+          # Generate services and firewall config from services.yaml
+          # Use shared script to avoid code duplication
+          chmod +x .github/scripts/generate-services-tfvars.py
+          ENABLED_SERVICES="$ENABLED_SERVICES" FIREWALL_RULES="$FIREWALL_RULES" python3 .github/scripts/generate-services-tfvars.py
+
+      - name: Initialize OpenTofu
+        run: |
+          cd tofu/stack
+          source ../.r2-credentials
+          export AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID"
+          export AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
+          tofu init -backend-config=../backend.hcl
+
+      - name: Apply infrastructure
+        run: |
+          cd tofu/stack
+          source ../.r2-credentials
+          export AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID"
+          export AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
+          tofu init -backend-config=../backend.hcl -reconfigure >/dev/null 2>&1 || true
+          tofu apply -var-file=config.tfvars -auto-approve
+
+      - name: Open SSH port temporarily
+        run: |
+          cd tofu/stack
+          source ../.r2-credentials
+          export AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID"
+          export AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
+
+          SERVER_ID=$(tofu output -raw server_id)
+          FIREWALL_ID=$(tofu output -raw ssh_firewall_id)
+
+          echo "Attaching SSH firewall (ID: $FIREWALL_ID) to server (ID: $SERVER_ID)..."
+
+          HTTP_STATUS=$(curl -s -o /tmp/attach_response.txt -w "%{http_code}" -X POST \
+            -H "Authorization: Bearer $TF_VAR_hcloud_token" \
+            -H "Content-Type: application/json" \
+            -d "{\"apply_to\":[{\"type\":\"server\",\"server\":{\"id\":$SERVER_ID}}]}" \
+            "https://api.hetzner.cloud/v1/firewalls/$FIREWALL_ID/actions/apply_to_resources")
+
+          if [ "$HTTP_STATUS" -ge 200 ] && [ "$HTTP_STATUS" -lt 300 ]; then
+            echo "✅ SSH firewall attached - port 22 open for tunnel installation"
+          else
+            echo "❌ Failed to attach firewall (HTTP $HTTP_STATUS)"
+            cat /tmp/attach_response.txt
+            exit 1
+          fi
+
+      - name: Install Cloudflare Tunnel via SSH
+        run: |
+          cd tofu/stack
+          source ../.r2-credentials
+          export AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID"
+          export AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
+
+          SERVER_IP=$(tofu output -raw server_ip)
+          TUNNEL_TOKEN=$(tofu output -raw tunnel_token)
+          echo "::add-mask::$TUNNEL_TOKEN"
+
+          echo "Waiting for SSH to become available on $SERVER_IP..."
+          # Wait for SSH to be ready (server may still be booting)
+          # Max wait: 2 minutes (24 attempts * 5s = 120s)
+          for i in {1..24}; do
+            if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -o BatchMode=yes \
+              root@"$SERVER_IP" "echo 'SSH ready'" 2>/dev/null; then
+              echo "✅ SSH is ready (attempt $i)"
+              break
+            fi
+            if [ $i -eq 24 ]; then
+              echo "❌ SSH did not become available after 2 minutes"
+              exit 1
+            fi
+            echo "Attempt $i/24 - waiting 5s..."
+            sleep 5
+          done
+
+          echo "Installing Cloudflare Tunnel on $SERVER_IP..."
+
+          # Write tunnel install script
+          cat > /tmp/install-tunnel.sh << SCRIPT
+          #!/bin/bash
+          set -e
+          echo 'Waiting for cloud-init to complete...'
+          cloud-init status --wait || true
+          echo 'Installing/updating Cloudflare Tunnel...'
+          systemctl stop cloudflared 2>/dev/null || true
+          # Uninstall existing service if present
+          if systemctl list-unit-files | grep -q cloudflared.service; then
+            echo 'Uninstalling existing cloudflared service...'
+            cloudflared service uninstall 2>/dev/null || true
+          fi
+          cloudflared service install $TUNNEL_TOKEN
+          systemctl enable cloudflared
+          systemctl start cloudflared
+          sleep 3
+          systemctl status cloudflared --no-pager || echo 'Warning: Tunnel service status check failed'
+          echo 'Tunnel started successfully!'
+          SCRIPT
+          sed -i 's/^          //' /tmp/install-tunnel.sh
+
+          ssh -o StrictHostKeyChecking=no -o ConnectTimeout=60 -o ServerAliveInterval=10 \
+            root@"$SERVER_IP" bash < /tmp/install-tunnel.sh
+          rm -f /tmp/install-tunnel.sh
+
+      - name: Close SSH port
+        if: always()
+        run: |
+          cd tofu/stack
+          if [ -f ../.r2-credentials ]; then
+            source ../.r2-credentials
+            export AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID"
+            export AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
+
+            SERVER_ID=$(tofu output -raw server_id 2>/dev/null || true)
+            FIREWALL_ID=$(tofu output -raw ssh_firewall_id 2>/dev/null || true)
+            # Validate IDs are numeric (tofu wrapper may write ::error:: to stdout)
+            [[ "$SERVER_ID" =~ ^[0-9]+$ ]] || SERVER_ID=""
+            [[ "$FIREWALL_ID" =~ ^[0-9]+$ ]] || FIREWALL_ID=""
+
+            if [ -n "$SERVER_ID" ] && [ -n "$FIREWALL_ID" ]; then
+              echo "Detaching SSH firewall (ID: $FIREWALL_ID) from server (ID: $SERVER_ID)..."
+
+              HTTP_STATUS=$(curl -s -o /tmp/detach_response.txt -w "%{http_code}" -X POST \
+                -H "Authorization: Bearer $TF_VAR_hcloud_token" \
+                -H "Content-Type: application/json" \
+                -d "{\"remove_from\":[{\"type\":\"server\",\"server\":{\"id\":$SERVER_ID}}]}" \
+                "https://api.hetzner.cloud/v1/firewalls/$FIREWALL_ID/actions/remove_from_resources")
+
+              if [ "$HTTP_STATUS" -ge 200 ] && [ "$HTTP_STATUS" -lt 300 ]; then
+                echo "✅ SSH firewall detached - port 22 closed"
+              else
+                echo "⚠️ Failed to detach firewall (HTTP $HTTP_STATUS) - may already be detached"
+                cat /tmp/detach_response.txt
+                # Don't fail - firewall might already be detached
+              fi
+            else
+              echo "⚠️ Could not get server/firewall IDs - skipping detach"
+            fi
+          else
+            echo "⚠️ R2 credentials not available - skipping SSH cleanup"
+          fi
+
+      - name: Deploy stacks
+        env:
+          SSH_PRIVATE_KEY_CONTENT: ${{ secrets.SSH_PRIVATE_KEY || inputs.ssh_private_key }}
+          GH_MIRROR_TOKEN: ${{ secrets.GH_MIRROR_TOKEN }}
+          GH_MIRROR_REPOS: ${{ secrets.GH_MIRROR_REPOS }}
+        run: |
+          chmod +x scripts/deploy.sh
+          ./scripts/deploy.sh
+
+          # Read Infisical credentials from server for use in later steps
+          echo "  Reading Infisical credentials from server..."
+          ssh nexus "cat /opt/docker-server/.infisical-token 2>/dev/null" > /tmp/infisical-token || true
+          ssh nexus "cat /opt/docker-server/.infisical-project-id 2>/dev/null" > /tmp/infisical-project-id || true
+          echo "  Infisical token: $([ -s /tmp/infisical-token ] && echo 'found' || echo 'not found')"
+          echo "  Infisical project ID: $([ -s /tmp/infisical-project-id ] && echo 'found' || echo 'not found')"
+
+      - name: Write infrastructure config to D1
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          DOMAIN: ${{ secrets.DOMAIN }}
+        run: |
+          echo "📝 Writing infrastructure config to D1..."
+          
+          # Get D1 database name from control-plane state
+          cd tofu/control-plane
+          source ../.r2-credentials
+          export AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID"
+          export AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
+          
+          # Initialize control-plane state to read D1 database name
+          tofu init -backend-config=../backend.hcl >/dev/null 2>&1 || true
+          D1_DATABASE_NAME=$(tofu output -raw d1_database_name 2>/dev/null || echo "")
+          cd ../..
+          
+          if [ -z "$D1_DATABASE_NAME" ]; then
+            echo "⚠️  Could not get D1 database name - skipping config write"
+            exit 0
+          fi
+          
+          # Server config values
+          SERVER_TYPE="cax31"
+          SERVER_LOCATION="${{ vars.SERVER_LOCATION || 'fsn1' }}"
+          
+          # Escape values for safe SQL insertion (single quotes doubled)
+          ESCAPED_SERVER_TYPE=${SERVER_TYPE//\'/\'\'}
+          ESCAPED_SERVER_LOCATION=${SERVER_LOCATION//\'/\'\'}
+          ESCAPED_DOMAIN=${DOMAIN//\'/\'\'}
+          
+          # Write config to D1
+          npx wrangler@4 d1 execute "$D1_DATABASE_NAME" --remote --command "INSERT OR REPLACE INTO config (key, value, updated_at) VALUES ('server_type', '$ESCAPED_SERVER_TYPE', datetime('now'))"
+          npx wrangler@4 d1 execute "$D1_DATABASE_NAME" --remote --command "INSERT OR REPLACE INTO config (key, value, updated_at) VALUES ('server_location', '$ESCAPED_SERVER_LOCATION', datetime('now'))"
+          npx wrangler@4 d1 execute "$D1_DATABASE_NAME" --remote --command "INSERT OR REPLACE INTO config (key, value, updated_at) VALUES ('domain', '$ESCAPED_DOMAIN', datetime('now'))"
+          npx wrangler@4 d1 execute "$D1_DATABASE_NAME" --remote --command "INSERT OR REPLACE INTO config (key, value, updated_at) VALUES ('last_spin_up', datetime('now'), datetime('now'))"
+
+          if [ "${{ inputs.silent_mode }}" = "true" ]; then
+            npx wrangler@4 d1 execute "$D1_DATABASE_NAME" --remote --command "INSERT OR REPLACE INTO config (key, value, updated_at) VALUES ('silent_mode', 'true', datetime('now'))"
+            echo "🔇 Silent mode enabled - automated emails suppressed"
+          fi
+
+          echo "✅ Infrastructure config written to D1"
+
+      - name: Log infrastructure provisioned
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          DOMAIN: ${{ secrets.DOMAIN }}
+        run: |
+          # Get container status for logging
+          CONTAINER_COUNT=$(cd tofu/stack && source ../.r2-credentials && export AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID" && export AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY" && tofu output -json enabled_services 2>/dev/null | jq 'length' || echo "0")
+          if [ -f .github/scripts/log-to-d1.sh ]; then
+            .github/scripts/log-to-d1.sh info "Infrastructure deployed" "{\"containers\":$CONTAINER_COUNT}"
+          fi
+
+      - name: Store credentials as Cloudflare Secrets
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          DOMAIN: ${{ secrets.DOMAIN }}
+        run: |
+          echo "📦 Storing credentials as Cloudflare Secrets..."
+
+          cd tofu/stack
+          source ../.r2-credentials
+          export AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID"
+          export AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
+
+          # Get secrets from OpenTofu output (for email credentials feature)
+          SECRETS_JSON=$(tofu output -json secrets 2>/dev/null || echo "{}")
+
+          # Get Pages project name from control-plane state
+          cd ../control-plane
+          tofu init -backend-config=../backend.hcl >/dev/null 2>&1 || true
+          PAGES_PROJECT=$(tofu output -raw pages_project_name 2>/dev/null || echo "")
+          cd ../..
+
+          if [ -z "$PAGES_PROJECT" ]; then
+            echo "⚠️  Pages project name not found - skipping credential storage"
+            exit 0
+          fi
+
+          # Store CREDENTIALS_JSON for email credentials feature (send-credentials.js)
+          if [ "$SECRETS_JSON" != "{}" ]; then
+            CREDENTIALS=$(echo "$SECRETS_JSON" | jq -c 'to_entries | map(select(.value != null and .value != "")) | from_entries')
+            if echo "$CREDENTIALS" | npx wrangler@4 pages secret put CREDENTIALS_JSON --project-name "$PAGES_PROJECT" 2>/dev/null; then
+              echo "  ✅ CREDENTIALS_JSON stored"
+            else
+              echo "  ⚠️  Failed to store CREDENTIALS_JSON"
+            fi
+          fi
+
+          # Store Infisical token + project ID for live Secrets page
+          # Both were read from server before SSH port was closed (see Deploy stacks step)
+          INFISICAL_TOKEN_VALUE=$(cat /tmp/infisical-token 2>/dev/null || echo "")
+          INFISICAL_PROJECT_ID=$(cat /tmp/infisical-project-id 2>/dev/null || echo "")
+
+          if [ -n "$INFISICAL_TOKEN_VALUE" ] && [ -n "$INFISICAL_PROJECT_ID" ]; then
+            echo "$INFISICAL_TOKEN_VALUE" | npx wrangler@4 pages secret put INFISICAL_TOKEN --project-name "$PAGES_PROJECT" 2>/dev/null && \
+              echo "  ✅ INFISICAL_TOKEN stored" || echo "  ⚠️  Failed to store INFISICAL_TOKEN"
+
+            echo "$INFISICAL_PROJECT_ID" | npx wrangler@4 pages secret put INFISICAL_PROJECT_ID --project-name "$PAGES_PROJECT" 2>/dev/null && \
+              echo "  ✅ INFISICAL_PROJECT_ID stored" || echo "  ⚠️  Failed to store INFISICAL_PROJECT_ID"
+          else
+            echo "  ⚠️  Infisical token or project ID not available - Secrets page will not work"
+          fi
+
+          # Store Infisical CF Access Service Token for server-to-server API calls
+          cd tofu/stack
+          INFISICAL_ST_JSON=$(tofu output -json infisical_service_token 2>/dev/null || echo "{}")
+          INFISICAL_CF_CLIENT_ID=$(echo "$INFISICAL_ST_JSON" | jq -r '.client_id // empty')
+          INFISICAL_CF_CLIENT_SECRET=$(echo "$INFISICAL_ST_JSON" | jq -r '.client_secret // empty')
+          cd ../..
+
+          if [ -n "$INFISICAL_CF_CLIENT_ID" ] && [ -n "$INFISICAL_CF_CLIENT_SECRET" ]; then
+            echo "$INFISICAL_CF_CLIENT_ID" | npx wrangler@4 pages secret put CF_ACCESS_CLIENT_ID --project-name "$PAGES_PROJECT" 2>/dev/null && \
+              echo "  ✅ CF_ACCESS_CLIENT_ID stored" || echo "  ⚠️  Failed to store CF_ACCESS_CLIENT_ID"
+
+            echo "$INFISICAL_CF_CLIENT_SECRET" | npx wrangler@4 pages secret put CF_ACCESS_CLIENT_SECRET --project-name "$PAGES_PROJECT" 2>/dev/null && \
+              echo "  ✅ CF_ACCESS_CLIENT_SECRET stored" || echo "  ⚠️  Failed to store CF_ACCESS_CLIENT_SECRET"
+          else
+            echo "  ⚠️  Infisical service token not available - Secrets page may not work if Cloudflare Access blocks API calls"
+          fi
+
+          echo "✅ Credentials stored"
+          if [ -f .github/scripts/log-to-d1.sh ]; then
+            .github/scripts/log-to-d1.sh info "Credentials stored in Cloudflare Secrets"
+          fi
+
+      - name: Redeploy Control Plane to activate secrets
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          echo "🔄 Redeploying Control Plane to activate new secrets..."
+          
+          cd tofu/control-plane
+          source ../.r2-credentials
+          export AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID"
+          export AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
+          D1_DATABASE_ID=$(tofu output -raw d1_database_id 2>/dev/null || echo "")
+          KV_NAMESPACE_ID=$(tofu output -raw kv_namespace_id 2>/dev/null || echo "")
+          PAGES_PROJECT=$(tofu output -raw pages_project_name 2>/dev/null || echo "")
+          cd ../..
+
+          if [ -z "$PAGES_PROJECT" ] || [ -z "$D1_DATABASE_ID" ]; then
+            echo "⚠️  Could not get Pages project info - skipping redeploy"
+            exit 0
+          fi
+
+          cd control-plane
+
+          # Build Astro frontend
+          npm ci
+          npm run build
+
+          # Copy functions into dist/ for Cloudflare Pages deployment
+          cp -r functions dist/functions
+
+          # Generate wrangler.toml with D1 + KV bindings
+          cat > wrangler.toml << EOF
+          name = "$PAGES_PROJECT"
+          compatibility_date = "2024-01-01"
+          pages_build_output_dir = "dist"
+
+          [[d1_databases]]
+          binding = "NEXUS_DB"
+          database_id = "$D1_DATABASE_ID"
+          EOF
+
+          if [ -n "$KV_NAMESPACE_ID" ]; then
+            cat >> wrangler.toml << EOF
+
+          [[kv_namespaces]]
+          binding = "NEXUS_KV"
+          id = "$KV_NAMESPACE_ID"
+          EOF
+          fi
+
+          sed -i 's/^          //' wrangler.toml
+
+          # Redeploy to production (with retry for Cloudflare API timeouts)
+          # --commit-message prevents UTF-8 issues with git commit messages
+          DEPLOY_OK=false
+          for ATTEMPT in 1 2 3; do
+            DEPLOY_OUTPUT=$(npx wrangler@4 pages deploy dist \
+              --project-name="$PAGES_PROJECT" \
+              --branch=main \
+              --commit-dirty=true \
+              --commit-message="Redeploy with secrets" 2>&1) && {
+              DEPLOY_OK=true
+              break
+            }
+            echo "$DEPLOY_OUTPUT"
+            if echo "$DEPLOY_OUTPUT" | grep -q "504\|Gateway Timeout\|upstream request timeout"; then
+              if [ "$ATTEMPT" -lt 3 ]; then
+                echo "⚠️  Cloudflare timeout on attempt $ATTEMPT - retrying in 15s..."
+                sleep 15
+              fi
+            else
+              echo "❌ Deploy failed (non-timeout error) - not retrying"
+              break
+            fi
+          done
+
+          rm wrangler.toml
+
+          if [ "$DEPLOY_OK" = "true" ]; then
+            echo "✅ Control Plane redeployed with new secrets!"
+          else
+            echo "❌ Control Plane redeploy failed after 3 attempts"
+            exit 1
+          fi
+
+      - name: Collect debug logs
+        if: always()
+        run: |
+          echo "📋 Collecting debug logs..."
+          if [ -f /tmp/debug.log ]; then
+            mkdir -p .cursor
+            cp /tmp/debug.log .cursor/debug.log
+            echo "✅ Debug logs saved to .cursor/debug.log"
+            echo "--- Debug Log Contents ---"
+            cat .cursor/debug.log || true
+          fi
+          if [ -f /tmp/docker-start.log ]; then
+            echo "--- Docker Start Log ---"
+            cat /tmp/docker-start.log || true
+          fi
+
+      - name: Show spin-up info
+        run: |
+          echo ""
+          echo "✅ Spin-up complete!"
+          echo ""
+          echo "📋 Control Panel: https://control.${{ secrets.DOMAIN }}"
+          echo "   (Manage services, view URLs, and access settings)"
+          echo ""
+      
+      - name: Sync deployed state to D1
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          DOMAIN: ${{ secrets.DOMAIN }}
+        run: |
+          # Sync deployed = enabled in D1 after successful deployment
+          if [ -f .github/scripts/sync-deployed-state.sh ]; then
+            .github/scripts/sync-deployed-state.sh
+          fi
+
+      - name: Log spin-up completed
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          DOMAIN: ${{ secrets.DOMAIN }}
+        run: |
+          if [ -f .github/scripts/log-to-d1.sh ]; then
+            .github/scripts/log-to-d1.sh info "Spin-up workflow completed successfully"
+          fi
+
+      - name: Send stack online email via Resend
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          ADMIN_EMAIL: ${{ secrets.TF_VAR_admin_email }}
+          USER_EMAIL: ${{ secrets.TF_VAR_user_email }}
+          DOMAIN: ${{ secrets.DOMAIN }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          if [ -n "$RESEND_API_KEY" ]; then
+            D1_DB_NAME="nexus-${DOMAIN//./-}-db"
+
+            # Check if silent mode is enabled (suppresses all automated emails)
+            SILENT_MODE=$(npx wrangler@4 d1 execute "$D1_DB_NAME" --remote --json \
+              --command "SELECT value FROM config WHERE key = 'silent_mode'" 2>/dev/null \
+              | jq -r '.[0].results[0].value // "false"' 2>/dev/null || echo "false")
+            if [ "$SILENT_MODE" = "true" ]; then
+              echo "🔇 Silent mode enabled - skipping stack online email"
+              exit 0
+            fi
+
+            # Check if stack-online email is enabled in D1
+            NOTIFY_ON_SPINUP=$(npx wrangler@4 d1 execute "$D1_DB_NAME" --remote --json \
+              --command "SELECT value FROM config WHERE key = 'notify_on_spinup'" 2>/dev/null \
+              | jq -r '.[0].results[0].value // "true"' 2>/dev/null || echo "true")
+            if [ "$NOTIFY_ON_SPINUP" != "true" ]; then
+              echo "📧 Stack online email disabled by user - skipping"
+              exit 0
+            fi
+
+            echo "📧 Sending stack online email..."
+            
+            EMAIL_HTML='<div style="font-family:monospace;background:#0a0a0f;color:#00ff88;padding:20px"><h1 style="color:#00ff88">✅ Nexus-Stack is Online</h1><p>Your stack is back online at <strong>DOMAIN_PLACEHOLDER</strong></p><h2>🔗 Quick Links</h2><ul><li><a href="https://control.DOMAIN_PLACEHOLDER" style="color:#00ff88">Control Panel</a> - Manage services &amp; view URLs</li></ul><p style="color:#999;font-size:12px;margin-top:1rem">Need credentials? Click "Send Credentials" in the Control Panel.</p></div>'
+            
+            EMAIL_HTML="${EMAIL_HTML//DOMAIN_PLACEHOLDER/$DOMAIN}"
+            
+            # Build email: User as primary recipient, Admin in CC
+            if [ -n "$USER_EMAIL" ]; then
+              JSON_PAYLOAD=$(jq -n \
+                --arg from "Nexus-Stack <nexus@$DOMAIN>" \
+                --arg to "$USER_EMAIL" \
+                --arg cc "$ADMIN_EMAIL" \
+                --arg subject "✅ Nexus-Stack Online" \
+                --arg html "$EMAIL_HTML" \
+                '{from: $from, to: [$to], cc: [$cc], subject: $subject, html: $html}')
+            else
+              JSON_PAYLOAD=$(jq -n \
+                --arg from "Nexus-Stack <nexus@$DOMAIN>" \
+                --arg to "$ADMIN_EMAIL" \
+                --arg subject "✅ Nexus-Stack Online" \
+                --arg html "$EMAIL_HTML" \
+                '{from: $from, to: [$to], subject: $subject, html: $html}')
+            fi
+            
+            HTTP_STATUS=$(curl -s -o /tmp/resend_response.txt -w "%{http_code}" -X POST 'https://api.resend.com/emails' \
+              -H "Authorization: Bearer $RESEND_API_KEY" \
+              -H "Content-Type: application/json" \
+              -d "$JSON_PAYLOAD")
+            
+            if [ "$HTTP_STATUS" -ge 200 ] && [ "$HTTP_STATUS" -lt 300 ]; then
+              if [ -n "$USER_EMAIL" ]; then
+                echo "✅ Stack online email sent to $USER_EMAIL (cc: $ADMIN_EMAIL)"
+              else
+                echo "✅ Stack online email sent to $ADMIN_EMAIL"
+              fi
+            else
+              echo "⚠️  Failed to send email (HTTP $HTTP_STATUS) - spin-up continues"
+              cat /tmp/resend_response.txt 2>/dev/null || true
+            fi
+          else
+            echo "⚠️  RESEND_API_KEY not configured - skipping email"
+          fi

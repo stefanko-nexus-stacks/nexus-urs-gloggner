@@ -1,0 +1,84 @@
+# =============================================================================
+# Meltano - Open Source Data Integration Platform (CLI-only)
+# =============================================================================
+# Build modular data pipelines with 500+ connectors using the Singer protocol.
+# Includes dbt integration for transformations.
+#
+# Internal Access: docker exec -it meltano meltano --help
+# Docs: https://docs.meltano.com/
+#
+# Git Integration: If Gitea is enabled, the shared workspace repo is
+# auto-cloned into /project/.
+# =============================================================================
+
+services:
+  meltano:
+    image: ${IMAGE_MELTANO:-meltano/meltano:v4.0}
+    container_name: meltano
+    restart: unless-stopped
+    environment:
+      - MELTANO_DATABASE_URI=postgresql://nexus-meltano:${MELTANO_DB_PASSWORD}@meltano-db:5432/meltano
+      - MELTANO_PROJECT_ROOT=/project
+      - MELTANO_CLI_LOG_LEVEL=INFO
+    env_file:
+      - path: .env
+        required: false
+    command: >
+      bash -c "
+        if [ -n \"$$GITEA_USERNAME\" ] && [ -n \"$$GITEA_PASSWORD\" ]; then
+          echo \"machine gitea login $$GITEA_USERNAME password $$GITEA_PASSWORD\" > ~/.netrc;
+          chmod 600 ~/.netrc;
+        fi;
+        if [ -n \"$$GITEA_REPO_URL\" ] && [ ! -d /project/$$REPO_NAME/.git ]; then
+          if git clone \"$$GITEA_REPO_URL\" /project/$$REPO_NAME; then
+            echo '[meltano] Cloned Git repo into /project/'$$REPO_NAME;
+          else
+            echo '[meltano] Warning: Failed to clone '$$GITEA_REPO_URL >&2;
+          fi;
+        fi;
+        exec sleep infinity
+      "
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+    volumes:
+      - meltano-data:/project
+    networks:
+      - app-network
+      - meltano-internal
+    depends_on:
+      meltano-db:
+        condition: service_healthy
+
+  meltano-db:
+    image: postgres:16-alpine
+    container_name: meltano-db
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+    environment:
+      - POSTGRES_USER=nexus-meltano
+      - POSTGRES_PASSWORD=${MELTANO_DB_PASSWORD}
+      - POSTGRES_DB=meltano
+    volumes:
+      - meltano-db-data:/var/lib/postgresql/data
+    networks:
+      - meltano-internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nexus-meltano -d meltano"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  meltano-data:
+  meltano-db-data:
+
+networks:
+  app-network:
+    external: true
+  meltano-internal:
+    driver: bridge

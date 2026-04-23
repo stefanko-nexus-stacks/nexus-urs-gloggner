@@ -1,0 +1,114 @@
+name: Initial Setup
+
+on:
+  workflow_dispatch:
+    inputs:
+      enabled_services:
+        description: 'Comma-separated list of services to enable (empty = core services only)'
+        required: false
+        default: ''
+        type: string
+      silent_mode:
+        description: 'Suppress all automated emails during initial setup (persists in D1 until reset via toggle-silent-mode workflow)'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: infrastructure
+  cancel-in-progress: false
+
+jobs:
+  setup-control-plane:
+    name: Setup Control Plane
+    uses: ./.github/workflows/setup-control-plane.yaml
+    secrets: inherit
+
+  configure-initial-services:
+    name: Configure Initial Services
+    needs: setup-control-plane
+    if: ${{ inputs.enabled_services != '' }}
+    runs-on: ubuntu-latest
+    outputs:
+      enabled_services: ${{ steps.build-list.outputs.enabled_services }}
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      DOMAIN: ${{ secrets.DOMAIN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Build enabled services list
+        id: build-list
+        run: |
+          # Start with core services (always enabled)
+          CORE_SERVICES="infisical,mailpit"
+          USER_SERVICES="${{ inputs.enabled_services }}"
+
+          # Combine core + user-selected services
+          if [ -n "$USER_SERVICES" ]; then
+            SERVICES="$CORE_SERVICES,$USER_SERVICES"
+          else
+            SERVICES="$CORE_SERVICES"
+          fi
+
+          # Remove duplicates and empty values, sort
+          SERVICES=$(echo "$SERVICES" | tr ',' '\n' | sort -u | grep -v '^$' | tr '\n' ',' | sed 's/,$//')
+
+          echo "enabled_services=$SERVICES" >> $GITHUB_OUTPUT
+          echo "📋 Enabled services: $SERVICES"
+
+      - name: Update D1 with selected services
+        run: |
+          D1_DATABASE_NAME="nexus-${DOMAIN//./-}-db"
+          ENABLED_SERVICES="${{ steps.build-list.outputs.enabled_services }}"
+
+          echo "📝 Updating D1 database: $D1_DATABASE_NAME"
+          echo "   Services to enable: $ENABLED_SERVICES"
+
+          # Create SQL file to batch updates (avoids D1 rate limits)
+          printf '%s\n' \
+            '-- Reset non-core services to disabled' \
+            'UPDATE services SET enabled = 0 WHERE core = 0;' \
+            > /tmp/enable_services.sql
+
+          # Add UPDATE statements for each selected service
+          IFS=',' read -ra SERVICE_ARRAY <<< "$ENABLED_SERVICES"
+          for service in "${SERVICE_ARRAY[@]}"; do
+            service=$(echo "$service" | tr -d '[:space:]')
+            if [ -n "$service" ]; then
+              echo "UPDATE services SET enabled = 1 WHERE name = '$service';" >> /tmp/enable_services.sql
+            fi
+          done
+
+          # Execute all updates in one batch
+          npx wrangler@4 d1 execute "$D1_DATABASE_NAME" --remote --file /tmp/enable_services.sql
+
+          echo "✅ D1 updated with initial service selection"
+
+  spin-up:
+    name: Spin Up Nexus-Stack
+    needs: [setup-control-plane, configure-initial-services]
+    if: ${{ always() && needs.setup-control-plane.result == 'success' && needs.configure-initial-services.result != 'failure' }}
+    uses: ./.github/workflows/spin-up.yml
+    with:
+      # Pass R2 credentials from setup-control-plane to spin-up
+      # This enables fully automated initial deployment without pre-existing secrets
+      r2_access_key_id: ${{ needs.setup-control-plane.outputs.r2_access_key_id }}
+      r2_secret_access_key: ${{ needs.setup-control-plane.outputs.r2_secret_access_key }}
+      # Pass R2 data bucket credentials (created during setup, not yet in GitHub Secrets)
+      r2_data_access_key: ${{ needs.setup-control-plane.outputs.r2_data_access_key }}
+      r2_data_secret_key: ${{ needs.setup-control-plane.outputs.r2_data_secret_key }}
+      r2_data_bucket: ${{ needs.setup-control-plane.outputs.r2_data_bucket }}
+      # Pass SSH keys (private key also passed as output since secrets set mid-run aren't visible to later jobs)
+      ssh_pubkey: ${{ needs.setup-control-plane.outputs.ssh_pubkey }}
+      ssh_private_key: ${{ needs.setup-control-plane.outputs.ssh_private_key }}
+      # Pass enabled services (if configured, otherwise spin-up reads from D1)
+      enabled_services: ${{ needs.configure-initial-services.outputs.enabled_services || '' }}
+      silent_mode: ${{ inputs.silent_mode }}
+    secrets: inherit

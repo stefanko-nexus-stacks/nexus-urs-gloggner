@@ -1,0 +1,36 @@
+# =============================================================================
+# Portainer - Docker Container Management UI
+# =============================================================================
+# https://www.portainer.io/
+# Provides a web-based UI for managing Docker containers, images, and volumes
+# =============================================================================
+
+services:
+  portainer:
+    image: ${IMAGE_PORTAINER:-portainer/portainer-ce:latest}
+    container_name: portainer
+    restart: unless-stopped
+    ports:
+      - "9090:9000"
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:9000/ || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - portainer_data:/data
+    networks:
+      - app-network
+
+volumes:
+  portainer_data:
+
+networks:
+  app-network:
+    external: true

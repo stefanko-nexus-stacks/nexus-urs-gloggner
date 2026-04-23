@@ -1,0 +1,26 @@
+# =============================================================================
+# Redpanda Connect - Streams Mode
+# =============================================================================
+# This file is no longer mounted into the container. Redpanda Connect now
+# runs in streams mode where pipelines are managed via the REST API.
+#
+# Create a pipeline from code-server terminal:
+#
+#   curl -X POST http://redpanda-connect:4195/streams/my-pipeline \
+#     -H "Content-Type: application/yaml" \
+#     -d '
+#   input:
+#     generate:
+#       interval: "10s"
+#       mapping: root = "hello"
+#   output:
+#     kafka_franz:
+#       seed_brokers: ["redpanda:9092"]
+#       topic: my-topic
+#   '
+#
+# List pipelines:   curl http://redpanda-connect:4195/streams
+# Delete pipeline:  curl -X DELETE http://redpanda-connect:4195/streams/my-pipeline
+#
+# Documentation: https://docs.redpanda.com/redpanda-connect/guides/streams_mode/
+# =============================================================================
