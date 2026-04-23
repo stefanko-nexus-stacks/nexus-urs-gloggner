@@ -112,6 +112,7 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           DOMAIN: ${{ secrets.DOMAIN }}
+          BASE_DOMAIN: ${{ secrets.BASE_DOMAIN }}
         run: |
           if [ -f .github/scripts/log-to-d1.sh ]; then
             chmod +x .github/scripts/log-to-d1.sh
@@ -756,7 +757,7 @@ jobs:
           echo ""
           echo "✅ Spin-up complete!"
           echo ""
-          echo "📋 Control Panel: https://control.${{ secrets.DOMAIN }}"
+          echo "📋 Control Panel: https://control-urs-gloggner.nona.company"
           echo "   (Manage services, view URLs, and access settings)"
           echo ""
       
@@ -813,14 +814,14 @@ jobs:
 
             echo "📧 Sending stack online email..."
             
-            EMAIL_HTML='<div style="font-family:monospace;background:#0a0a0f;color:#00ff88;padding:20px"><h1 style="color:#00ff88">✅ Nexus-Stack is Online</h1><p>Your stack is back online at <strong>DOMAIN_PLACEHOLDER</strong></p><h2>🔗 Quick Links</h2><ul><li><a href="https://control.DOMAIN_PLACEHOLDER" style="color:#00ff88">Control Panel</a> - Manage services &amp; view URLs</li></ul><p style="color:#999;font-size:12px;margin-top:1rem">Need credentials? Click "Send Credentials" in the Control Panel.</p></div>'
+            EMAIL_HTML='<div style="font-family:monospace;background:#0a0a0f;color:#00ff88;padding:20px"><h1 style="color:#00ff88">✅ Nexus-Stack is Online</h1><p>Your stack is back online at <strong>DOMAIN_PLACEHOLDER</strong></p><h2>🔗 Quick Links</h2><ul><li><a href="https://control-urs-gloggner.nona.company" style="color:#00ff88">Control Panel</a> - Manage services &amp; view URLs</li></ul><p style="color:#999;font-size:12px;margin-top:1rem">Need credentials? Click "Send Credentials" in the Control Panel.</p></div>'
             
             EMAIL_HTML="${EMAIL_HTML//DOMAIN_PLACEHOLDER/$DOMAIN}"
             
             # Build email: User as primary recipient, Admin in CC
             if [ -n "$USER_EMAIL" ]; then
               JSON_PAYLOAD=$(jq -n \
-                --arg from "Nexus-Stack <nexus@$DOMAIN>" \
+                --arg from "Nexus-Stack <nexus@$BASE_DOMAIN>" \
                 --arg to "$USER_EMAIL" \
                 --arg cc "$ADMIN_EMAIL" \
                 --arg subject "✅ Nexus-Stack Online" \
@@ -828,7 +829,7 @@ jobs:
                 '{from: $from, to: [$to], cc: [$cc], subject: $subject, html: $html}')
             else
               JSON_PAYLOAD=$(jq -n \
-                --arg from "Nexus-Stack <nexus@$DOMAIN>" \
+                --arg from "Nexus-Stack <nexus@$BASE_DOMAIN>" \
                 --arg to "$ADMIN_EMAIL" \
                 --arg subject "✅ Nexus-Stack Online" \
                 --arg html "$EMAIL_HTML" \

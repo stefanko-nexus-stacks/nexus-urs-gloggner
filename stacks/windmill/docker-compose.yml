@@ -34,7 +34,7 @@ services:
     environment:
       MODE: server
       DATABASE_URL: postgres://nexus-windmill:${WINDMILL_DB_PASSWORD}@windmill-db:5432/windmill?sslmode=disable
-      BASE_URL: https://windmill.${DOMAIN}
+      BASE_URL: https://windmill-urs-gloggner.nona.company
       LSP_HOST: http://windmill-lsp:3001
       SUPERADMIN_SECRET: ${WINDMILL_SUPERADMIN_SECRET}
     depends_on:

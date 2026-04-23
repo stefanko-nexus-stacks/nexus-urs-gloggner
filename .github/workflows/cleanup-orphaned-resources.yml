@@ -61,7 +61,7 @@ jobs:
       - name: Cleanup Access Application
         run: |
           echo "🔍 Finding Access Application..."
-          ACCESS_APP_DOMAIN="control.${{ secrets.DOMAIN }}"
+          ACCESS_APP_DOMAIN="control-urs-gloggner.nona.company"
           
           # Get all Access applications for the zone
           ACCESS_APPS_RESPONSE=$(curl -s \

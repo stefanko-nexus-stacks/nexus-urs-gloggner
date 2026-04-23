@@ -103,7 +103,7 @@ OM_PRINCIPAL_DOMAIN=$(echo "$ADMIN_EMAIL" | cut -d'@' -f2)
 # `[ -n "$GITEA_USER_EMAIL" ]`, so an empty-after-trim GITEA_USER_EMAIL
 # (no USER_EMAIL set, or its first entry was whitespace-only) skips user
 # creation cleanly instead of colliding with the admin row.
-SSH_HOST="ssh.${DOMAIN}"
+SSH_HOST="ssh-urs-gloggner.nona.company"
 
 if [ -z "$DOMAIN" ]; then
     echo -e "${RED}Error: Could not read domain from config.tfvars${NC}"
@@ -572,7 +572,7 @@ if echo "$ENABLED_SERVICES" | grep -qw "kestra"; then
 KESTRA_ADMIN_USER=$ADMIN_EMAIL
 KESTRA_ADMIN_PASSWORD=$KESTRA_PASS
 KESTRA_DB_PASSWORD=$KESTRA_DB_PASS
-KESTRA_URL=https://kestra.${DOMAIN}
+KESTRA_URL=https://kestra-urs-gloggner.nona.company
 EOF
     echo -e "${GREEN}  ✓ Kestra .env generated${NC}"
 fi
@@ -583,7 +583,7 @@ if echo "$ENABLED_SERVICES" | grep -qw "cloudbeaver"; then
     cat > "$STACKS_DIR/cloudbeaver/.env" << EOF
 # Auto-generated from OpenTofu secrets - DO NOT COMMIT
 CB_SERVER_NAME=Nexus CloudBeaver
-CB_SERVER_URL=https://cloudbeaver.${DOMAIN}
+CB_SERVER_URL=https://cloudbeaver-urs-gloggner.nona.company
 CB_ADMIN_NAME=nexus-cloudbeaver
 CB_ADMIN_PASSWORD=$CLOUDBEAVER_PASS
 EOF
@@ -631,14 +631,14 @@ POSTGRES_PASSWORD=${HOPPSCOTCH_DB_PASS}
 JWT_SECRET=${HOPPSCOTCH_JWT}
 SESSION_SECRET=${HOPPSCOTCH_SESSION}
 DATA_ENCRYPTION_KEY=${HOPPSCOTCH_ENCRYPTION}
-REDIRECT_URL=https://hoppscotch.${DOMAIN}
-WHITELISTED_ORIGINS=https://hoppscotch.${DOMAIN}
-VITE_BASE_URL=https://hoppscotch.${DOMAIN}
-VITE_SHORTCODE_BASE_URL=https://hoppscotch.${DOMAIN}
-VITE_ADMIN_URL=https://hoppscotch.${DOMAIN}/admin
-VITE_BACKEND_GQL_URL=https://hoppscotch.${DOMAIN}/backend/graphql
-VITE_BACKEND_WS_URL=wss://hoppscotch.${DOMAIN}/backend/graphql
-VITE_BACKEND_API_URL=https://hoppscotch.${DOMAIN}/backend/v1
+REDIRECT_URL=https://hoppscotch-urs-gloggner.nona.company
+WHITELISTED_ORIGINS=https://hoppscotch-urs-gloggner.nona.company
+VITE_BASE_URL=https://hoppscotch-urs-gloggner.nona.company
+VITE_SHORTCODE_BASE_URL=https://hoppscotch-urs-gloggner.nona.company
+VITE_ADMIN_URL=https://hoppscotch-urs-gloggner.nona.company/admin
+VITE_BACKEND_GQL_URL=https://hoppscotch-urs-gloggner.nona.company/backend/graphql
+VITE_BACKEND_WS_URL=wss://hoppscotch-urs-gloggner.nona.company/backend/graphql
+VITE_BACKEND_API_URL=https://hoppscotch-urs-gloggner.nona.company/backend/v1
 VITE_ALLOWED_AUTH_PROVIDERS=EMAIL
 MAILER_USE_CUSTOM_CONFIGS=true
 MAILER_SMTP_ENABLE=false
@@ -757,7 +757,7 @@ if echo "$ENABLED_SERVICES" | grep -qw "prefect"; then
     cat > "$STACKS_DIR/prefect/.env" << EOF
 # Auto-generated from OpenTofu secrets - DO NOT COMMIT
 PREFECT_DB_PASSWORD=${PREFECT_DB_PASS}
-PREFECT_UI_API_URL=https://prefect.${DOMAIN}/api
+PREFECT_UI_API_URL=https://prefect-urs-gloggner.nona.company/api
 EOF
     echo -e "${GREEN}  ✓ Prefect .env generated${NC}"
 fi
@@ -925,7 +925,7 @@ LAKEFS_BLOCKSTORE_S3_DISCOVER_BUCKET_REGION=false
 LAKEFS_BLOCKSTORE_S3_REGION=${HETZNER_S3_REGION}
 LAKEFS_BLOCKSTORE_S3_CREDENTIALS_ACCESS_KEY_ID=${HETZNER_S3_ACCESS_KEY}
 LAKEFS_BLOCKSTORE_S3_CREDENTIALS_SECRET_ACCESS_KEY=${HETZNER_S3_SECRET_KEY}
-LAKEFS_GATEWAYS_S3_DOMAIN_NAME=s3.lakefs.${DOMAIN}
+LAKEFS_GATEWAYS_S3_DOMAIN_NAME=s3.lakefs-urs-gloggner.nona.company
 # Note: LAKEFS_INSTALLATION_* vars only work with database.type=local
 # Admin user is created via API in Step 7/7
 POSTGRES_PASSWORD=${LAKEFS_DB_PASS}
@@ -940,7 +940,7 @@ LAKEFS_DATABASE_POSTGRES_CONNECTION_STRING=postgres://nexus-lakefs:${LAKEFS_DB_P
 LAKEFS_AUTH_ENCRYPT_SECRET_KEY=${LAKEFS_ENCRYPT_SECRET}
 LAKEFS_BLOCKSTORE_TYPE=local
 LAKEFS_BLOCKSTORE_LOCAL_PATH=/data
-LAKEFS_GATEWAYS_S3_DOMAIN_NAME=s3.lakefs.${DOMAIN}
+LAKEFS_GATEWAYS_S3_DOMAIN_NAME=s3.lakefs-urs-gloggner.nona.company
 # Note: LAKEFS_INSTALLATION_* vars only work with database.type=local
 # Admin user is created via API in Step 7/7
 POSTGRES_PASSWORD=${LAKEFS_DB_PASS}
@@ -1157,7 +1157,7 @@ if echo "$ENABLED_SERVICES" | grep -qw "appsmith" && [ -n "$APPSMITH_ENCRYPTION_
 APPSMITH_ENCRYPTION_PASSWORD=${APPSMITH_ENCRYPTION_PASSWORD}
 APPSMITH_ENCRYPTION_SALT=${APPSMITH_ENCRYPTION_SALT}
 APPSMITH_DISABLE_TELEMETRY=true
-APPSMITH_CUSTOM_DOMAIN=https://appsmith.${DOMAIN}
+APPSMITH_CUSTOM_DOMAIN=https://appsmith-urs-gloggner.nona.company
 EOF
     echo -e "${GREEN}  ✓ Appsmith .env generated${NC}"
 fi
@@ -1171,7 +1171,7 @@ NC_DB=pg://nocodb-db:5432?u=nexus-nocodb&p=${NOCODB_DB_PASS}&d=nocodb
 NC_AUTH_JWT_SECRET=${NOCODB_JWT_SECRET}
 NC_ADMIN_EMAIL=${ADMIN_EMAIL}
 NC_ADMIN_PASSWORD=${NOCODB_ADMIN_PASS}
-NC_PUBLIC_URL=https://nocodb.${DOMAIN}
+NC_PUBLIC_URL=https://nocodb-urs-gloggner.nona.company
 NOCODB_DB_PASSWORD=${NOCODB_DB_PASS}
 EOF
     echo -e "${GREEN}  ✓ NocoDB .env generated${NC}"
@@ -2054,10 +2054,10 @@ EOF
         build_folder "redpanda" \
             "REDPANDA_SASL_USERNAME" "nexus-redpanda" \
             "REDPANDA_SASL_PASSWORD" "$REDPANDA_ADMIN_PASS" \
-            "REDPANDA_KAFKA_PUBLIC_URL" "redpanda-kafka.${DOMAIN}:9092" \
-            "REDPANDA_SCHEMA_REGISTRY_PUBLIC_URL" "redpanda-schema-registry.${DOMAIN}:18081" \
-            "REDPANDA_ADMIN_PUBLIC_URL" "redpanda-admin.${DOMAIN}:9644" \
-            "REDPANDA_CONNECT_PUBLIC_URL" "redpanda-connect-api.${DOMAIN}:4195"
+            "REDPANDA_KAFKA_PUBLIC_URL" "redpanda-kafka-urs-gloggner.nona.company:9092" \
+            "REDPANDA_SCHEMA_REGISTRY_PUBLIC_URL" "redpanda-schema-registry-urs-gloggner.nona.company:18081" \
+            "REDPANDA_ADMIN_PUBLIC_URL" "redpanda-admin-urs-gloggner.nona.company:9644" \
+            "REDPANDA_CONNECT_PUBLIC_URL" "redpanda-connect-api-urs-gloggner.nona.company:4195"
 
         build_folder "meltano" \
             "MELTANO_DB_PASSWORD" "$MELTANO_DB_PASS"
@@ -2095,7 +2095,7 @@ EOF
             "GITEA_ADMIN_PASSWORD" "$GITEA_ADMIN_PASS" \
             "GITEA_USER_USERNAME" "$GITEA_USER_USERNAME" \
             "GITEA_USER_PASSWORD" "$GITEA_USER_PASS" \
-            "GITEA_REPO_URL" "https://git.${DOMAIN}/${GITEA_REPO_OWNER:-$ADMIN_USERNAME}/${REPO_NAME:-nexus-${DOMAIN//./-}-gitea}.git" \
+            "GITEA_REPO_URL" "https://git-urs-gloggner.nona.company/${GITEA_REPO_OWNER:-$ADMIN_USERNAME}/${REPO_NAME:-nexus-${DOMAIN//./-}-gitea}.git" \
             "GITEA_DB_PASSWORD" "$GITEA_DB_PASS"
 
         build_folder "clickhouse" \
@@ -3241,7 +3241,7 @@ triggers:
                     -H 'Content-Type: application/json' \
                     -d '{
                         \"name\": \"Woodpecker CI\",
-                        \"redirect_uris\": [\"https://woodpecker.${DOMAIN}/authorize\"],
+                        \"redirect_uris\": [\"https://woodpecker-urs-gloggner.nona.company/authorize\"],
                         \"confidential_client\": true
                     }'" 2>/dev/null || echo "")
 
@@ -3482,7 +3482,7 @@ if echo "$ENABLED_SERVICES" | grep -qw "wikijs" && [ -n "$WIKIJS_ADMIN_PASS" ]; 
         SETUP_PAYLOAD=$(jq -n \
             --arg email "$WIKIJS_EMAIL" \
             --arg pass "$WIKIJS_ADMIN_PASS" \
-            --arg url "https://wiki.${DOMAIN}" \
+            --arg url "https://wiki-urs-gloggner.nona.company" \
             '{query: "mutation ($input: SetupInput!) { setup(input: $input) { responseResult { succeeded message } } }", variables: {input: {adminEmail: $email, adminPassword: $pass, adminPasswordConfirm: $pass, siteUrl: $url, telemetry: false}}}')
 
         RESULT=$(printf '%s' "$SETUP_PAYLOAD" | ssh nexus "curl -s -X POST 'http://localhost:3005/graphql' \

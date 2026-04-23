@@ -30,14 +30,14 @@ output "ssh_firewall_id" {
 
 output "ssh_command" {
   description = "SSH command via Cloudflare Tunnel (requires cloudflared locally)"
-  value       = "cloudflared access ssh --hostname ssh.${var.domain}"
+  value       = "cloudflared access ssh --hostname ssh-urs-gloggner.nona.company"
 }
 
 output "ssh_config" {
   description = "Add this to ~/.ssh/config for easy access"
   value       = <<-EOT
     Host nexus
-      HostName ssh.${var.domain}
+      HostName ssh-urs-gloggner.nona.company
       User root
       ProxyCommand cloudflared access ssh --hostname %h
   EOT
@@ -82,7 +82,7 @@ output "service_urls" {
   description = "URLs for all enabled services with a subdomain"
   value = {
     for key, service in local.enabled_services_with_subdomain :
-    key => "https://${service.subdomain}.${var.domain}"
+    key => "https://${service.subdomain}-urs-gloggner.nona.company"
   }
 }
 
@@ -192,8 +192,8 @@ output "secrets" {
 
     # RedPanda SASL (for external Kafka access)
     redpanda_admin_password        = random_password.redpanda_admin.result
-    redpanda_kafka_public_url      = "redpanda-kafka.${var.domain}:9092"
-    redpanda_schema_registry_public_url = "http://redpanda-schema-registry.${var.domain}:18081"
+    redpanda_kafka_public_url      = "redpanda-kafka-urs-gloggner.nona.company:9092"
+    redpanda_schema_registry_public_url = "http://redpanda-schema-registry-urs-gloggner.nona.company:18081"
 
     # RustFS
     rustfs_root_password = random_password.rustfs_root.result

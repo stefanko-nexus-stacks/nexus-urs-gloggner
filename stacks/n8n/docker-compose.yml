@@ -1,6 +1,6 @@
 # =============================================================================
 # n8n - Workflow Automation Tool
-# https://n8n.${DOMAIN}
+# https://n8n-urs-gloggner.nona.company
 # =============================================================================
 # n8n is a free and source-available workflow automation tool.
 # Login: Owner account created during first deployment
@@ -16,10 +16,10 @@ services:
     ports:
       - "5678:5678"
     environment:
-      - N8N_HOST=n8n.${DOMAIN}
+      - N8N_HOST=n8n-urs-gloggner.nona.company
       - N8N_PORT=5678
       - N8N_PROTOCOL=https
-      - WEBHOOK_URL=https://n8n.${DOMAIN}/
+      - WEBHOOK_URL=https://n8n-urs-gloggner.nona.company/
       - GENERIC_TIMEZONE=Europe/Zurich
       - TZ=Europe/Zurich
       # Database (SQLite by default, can upgrade to PostgreSQL)

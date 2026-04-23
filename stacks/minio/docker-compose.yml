@@ -26,7 +26,7 @@ services:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
       # Console configuration
-      MINIO_BROWSER_REDIRECT_URL: https://minio.${DOMAIN}
+      MINIO_BROWSER_REDIRECT_URL: https://minio-urs-gloggner.nona.company
     command: server /data --console-address ":9001"
     deploy:
       resources:

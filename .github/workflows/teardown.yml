@@ -186,7 +186,7 @@ jobs:
           echo "   ✓ R2 State Bucket - PRESERVED"
           echo ""
           echo "📋 Visit the Control Plane to re-deploy:"
-          echo "   https://control.${{ secrets.DOMAIN }}"
+          echo "   https://control-urs-gloggner.nona.company"
 
       - name: Write teardown timestamp to D1
         env:

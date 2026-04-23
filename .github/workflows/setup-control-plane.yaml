@@ -1340,7 +1340,7 @@ jobs:
           echo ""
           echo "✅ Control Plane setup complete!"
           echo ""
-          echo "📋 Control Plane: https://control.${{ secrets.DOMAIN }}"
+          echo "📋 Control Plane: https://control-urs-gloggner.nona.company"
           echo ""
           echo "ℹ️  Next steps:"
           echo "   1. Use the Control Plane to manage your infrastructure"
