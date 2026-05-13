@@ -483,7 +483,7 @@ async function sendNotification(env, config) {
 
   try {
     const teardownTime = `${config.teardownTime} ${getTimezoneAbbr(config.timezone)}`;
-    const controlPlaneUrl = safeHttpsUrl(env.CONTROL_PLANE_URL, `https://control.${env.DOMAIN}`);
+    const controlPlaneUrl = safeHttpsUrl(env.CONTROL_PLANE_URL, `https://control-urs-gloggner.nona.company`);
 
     const emailHtml = `
       <div style="font-family:monospace;background:#0a0a0f;color:#00ff88;padding:20px">
