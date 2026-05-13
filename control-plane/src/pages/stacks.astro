@@ -1,0 +1,316 @@
+---
+import Layout from '../layouts/Layout.astro';
+import StackTable from '../components/StackTable.astro';
+---
+
+<Layout title="Stack Management" activeNav="stacks">
+  <div class="services-panel">
+    <div class="panel-header">
+      <h2>Stack Management</h2>
+      <div class="panel-controls">
+        <div class="view-toggle" role="group" aria-label="View">
+          <button id="view-grid" aria-pressed="true">Grid</button>
+          <button id="view-list" aria-pressed="false">List</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="search-panel">
+      <input type="text" id="stacks-search" class="search-input" placeholder='Search stacks... (press "/" to focus, Enter for full search)' autocomplete="off">
+    </div>
+
+    <div id="grid-view" class="view">
+      <div class="categories-grid" id="categories-grid">
+        <p class="loading-text">Loading categories...</p>
+      </div>
+    </div>
+
+    <div id="list-view" class="view" hidden>
+      <StackTable />
+    </div>
+  </div>
+</Layout>
+
+<style>
+  .services-panel { margin-bottom: 2rem; }
+
+  .panel-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 1rem;
+    margin-bottom: 1rem;
+  }
+
+  .panel-header h2 { margin: 0; }
+
+  .search-panel {
+    position: relative;
+    margin-bottom: 1.5rem;
+  }
+
+  .search-input {
+    width: 100%;
+    padding: 0.8rem 1rem;
+    background: rgba(0, 10, 5, 0.8);
+    border: 1px solid rgba(0, 255, 136, 0.3);
+    color: #c0d0c0;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.9rem;
+    border-radius: 4px;
+    transition: border-color 0.3s, box-shadow 0.3s;
+  }
+
+  .search-input:focus {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: 0 0 15px rgba(0, 255, 136, 0.15);
+  }
+
+  .search-input::placeholder { color: #607080; }
+
+  .categories-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+    gap: 1rem;
+  }
+
+  .loading-text {
+    color: #607080;
+    font-size: 0.8rem;
+  }
+
+  :global(.category-card) {
+    display: block;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    padding: 1rem 1.2rem;
+    text-decoration: none;
+    transition: all 0.3s;
+  }
+
+  :global(.category-card:hover) {
+    border-color: rgba(0, 255, 136, 0.3);
+    box-shadow: 0 0 15px rgba(0, 255, 136, 0.1);
+  }
+
+  :global(.category-card-name) {
+    color: var(--accent);
+    font-weight: 700;
+    font-size: 0.9rem;
+  }
+
+  :global(.category-card-count) {
+    color: var(--text-muted);
+    font-size: 1.5rem;
+    font-weight: 700;
+  }
+
+  :global(.category-card-stats) {
+    margin-top: 0.5rem;
+    font-size: 0.75rem;
+    display: flex;
+    gap: 0.9rem;
+    flex-wrap: wrap;
+  }
+
+  :global(.category-card-stats .running)  { color: var(--accent); }
+  :global(.category-card-stats .pending)  { color: var(--warning); }
+  :global(.category-card-stats .disabled) { color: var(--text-muted); }
+</style>
+
+<script is:inline>
+  const VIEW_KEY = 'stacksView';
+
+  let allServices = [];
+  let loading = true;
+  let loadError = null;
+  let currentView = (localStorage.getItem(VIEW_KEY) === 'list') ? 'list' : 'grid';
+  let currentQuery = '';
+  let currentFilter = null; // 'pending' from ?filter=pending query param
+
+  function setView(view) {
+    currentView = view;
+    localStorage.setItem(VIEW_KEY, view);
+    document.getElementById('view-grid').setAttribute('aria-pressed', view === 'grid');
+    document.getElementById('view-list').setAttribute('aria-pressed', view === 'list');
+    document.getElementById('grid-view').hidden = view !== 'grid';
+    document.getElementById('list-view').hidden = view !== 'list';
+    applyFilterAndRender();
+  }
+
+  async function loadServices() {
+    try {
+      await window.NS.fetchDomain();
+      const data = await window.NS.getServices();
+      if (data && data.success) {
+        allServices = data.services || [];
+        loadError = null;
+      } else {
+        allServices = [];
+        loadError = 'Failed to load stacks. Refresh the page to retry.';
+      }
+    } catch (error) {
+      console.error('Failed to load services:', error);
+      allServices = [];
+      loadError = 'Failed to load stacks. Refresh the page to retry.';
+    } finally {
+      // Always clear loading — leaving it set on failure strands the page on
+      // the "Loading..." placeholder forever.
+      loading = false;
+      applyFilterAndRender();
+    }
+  }
+
+  function filteredServices() {
+    let services = allServices.slice();
+    if (currentFilter === 'pending') {
+      services = services.filter(function(s) { return s.pending; });
+    }
+    if (currentQuery) {
+      const q = currentQuery.toLowerCase();
+      services = services.filter(function(s) {
+        const cat = window.NS.CATEGORIES[s.category];
+        const catName = cat ? cat.name.toLowerCase() : '';
+        return s.name.toLowerCase().includes(q) ||
+          s.description.toLowerCase().includes(q) ||
+          (s.long_description && s.long_description.toLowerCase().includes(q)) ||
+          catName.includes(q);
+      });
+    }
+    return services;
+  }
+
+  function applyFilterAndRender() {
+    // Skip until first fetch resolves so the initial "Loading..." placeholder
+    // isn't replaced with a misleading "No services found" empty state.
+    if (loading) return;
+    const services = filteredServices();
+    if (currentView === 'list') {
+      window.NS.renderTable(services, currentEmptyMessage());
+    } else {
+      renderGrid(services);
+    }
+  }
+
+  function currentEmptyMessage() {
+    if (loadError) return loadError;
+    if (allServices.length === 0) return 'No services found. Run Spin Up to initialize.';
+    return 'No stacks match the current filter.';
+  }
+
+  function renderGrid(services) {
+    const grid = document.getElementById('categories-grid');
+    grid.innerHTML = '';
+
+    if (loadError) {
+      grid.innerHTML = '<p class="loading-text">' + escapeHtml(loadError) + '</p>';
+      return;
+    }
+
+    if (allServices.length === 0) {
+      grid.innerHTML = '<p class="loading-text">No services found. Run Spin Up to initialize.</p>';
+      return;
+    }
+
+    // Aggregate by category.
+    const counts = {};
+    services.forEach(function(s) {
+      if (!s.category) return;
+      if (!counts[s.category]) counts[s.category] = { total: 0, running: 0, pending: 0, disabled: 0 };
+      counts[s.category].total++;
+      const status = window.NS.resolveStatus(s);
+      if (status === 'running') counts[s.category].running++;
+      else if (status === 'pending-enable' || status === 'pending-disable') counts[s.category].pending++;
+      else counts[s.category].disabled++;
+    });
+
+    let rendered = 0;
+    window.NS.CATEGORY_ORDER.forEach(function(slug) {
+      const stats = counts[slug];
+      if (!stats) return;
+      const cat = window.NS.CATEGORIES[slug];
+      if (!cat) return;
+
+      const card = document.createElement('a');
+      card.className = 'category-card';
+      card.href = '/category?cat=' + slug;
+
+      let statsHtml = '';
+      if (stats.running > 0)  statsHtml += '<span class="running"><span aria-hidden="true">●</span> ' + stats.running + ' running</span>';
+      if (stats.pending > 0)  statsHtml += '<span class="pending"><span aria-hidden="true">◐</span> ' + stats.pending + ' pending</span>';
+      if (stats.disabled > 0) statsHtml += '<span class="disabled"><span aria-hidden="true">○</span> ' + stats.disabled + ' disabled</span>';
+      if (!statsHtml) statsHtml = '<span>—</span>';
+
+      card.innerHTML =
+        '<div style="display: flex; justify-content: space-between; align-items: flex-start;">' +
+          '<div class="category-card-name">' + escapeHtml(cat.name) + '</div>' +
+          '<div class="category-card-count">' + stats.total + '</div>' +
+        '</div>' +
+        '<div class="category-card-stats">' + statsHtml + '</div>';
+
+      grid.appendChild(card);
+      rendered++;
+    });
+
+    if (rendered === 0) {
+      grid.innerHTML = '<p class="loading-text">No stacks match the current filter.</p>';
+    }
+  }
+
+  // Init from URL + localStorage
+  const urlParams = new URLSearchParams(window.location.search);
+  if (urlParams.get('filter') === 'pending') {
+    currentFilter = 'pending';
+    // Pending filter is most useful in list view — auto-switch.
+    currentView = 'list';
+    localStorage.setItem(VIEW_KEY, 'list');
+  }
+  const initialQuery = urlParams.get('q') || '';
+  if (initialQuery) currentQuery = initialQuery;
+
+  setView(currentView);
+  if (initialQuery) document.getElementById('stacks-search').value = initialQuery;
+
+  // Event wiring
+  document.getElementById('view-grid').addEventListener('click', function() { setView('grid'); });
+  document.getElementById('view-list').addEventListener('click', function() { setView('list'); });
+
+  let searchTimer;
+  const searchInput = document.getElementById('stacks-search');
+  searchInput.addEventListener('input', function(e) {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(function() {
+      currentQuery = e.target.value;
+      applyFilterAndRender();
+    }, 150);
+  });
+  searchInput.addEventListener('keydown', function(e) {
+    if (e.key === 'Enter' && searchInput.value.trim()) {
+      window.location.href = '/search?q=' + encodeURIComponent(searchInput.value.trim());
+    }
+  });
+
+  // Keyboard — wrap the table controller so list-only shortcuts (j/k/Enter/e/c)
+  // are suppressed while the grid is active. The controller retains focus/items
+  // across view switches, so we gate via a live proxy instead of re-registering.
+  const gatedList = {
+    get items() { return currentView === 'list' ? window.NS.tableController.items : []; },
+    get focus() { return window.NS.tableController.focus; },
+    set focus(v) { window.NS.tableController.focus = v; },
+    render: function() { window.NS.tableController.render(); },
+    onOpen: function(s) { window.NS.tableController.onOpen(s); },
+    onToggle: function(s) { window.NS.tableController.onToggle(s); },
+    onCategory: function(s) { window.NS.tableController.onCategory(s); },
+  };
+  window.NS.registerKeyboard({
+    searchInputId: 'stacks-search',
+    list: gatedList,
+  });
+
+  // Reload whenever a toggle succeeds anywhere (fired by window.NS.toggleService).
+  window.addEventListener('stacks:updated', loadServices);
+
+  loadServices();
+</script>

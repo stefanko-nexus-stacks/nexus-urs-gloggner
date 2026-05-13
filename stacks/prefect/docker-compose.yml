@@ -1,0 +1,140 @@
+# =============================================================================
+# Prefect - Workflow Orchestration Platform
+# =============================================================================
+# Modern Python-native workflow orchestration for data pipelines.
+# Access via: https://prefect.<domain>
+# Default port: 4200
+#
+# Components:
+# - prefect: API server + UI
+# - prefect-services: Background services (scheduler, triggers, events)
+# - prefect-worker: Local flow executor (work pool: "local-pool")
+# - prefect-db: Dedicated PostgreSQL database
+#
+# Git Integration: If Gitea is enabled, the shared workspace repo is
+# auto-cloned into /flows/ in the worker container.
+#
+# SECURITY:
+# - Protected by Cloudflare Access (email OTP authentication)
+# - No built-in authentication on self-hosted Prefect Server
+# =============================================================================
+
+services:
+  prefect:
+    image: ${IMAGE_PREFECT:-prefecthq/prefect:3-latest}
+    container_name: prefect
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      PREFECT_API_DATABASE_CONNECTION_URL: "postgresql+asyncpg://nexus-prefect:${PREFECT_DB_PASSWORD}@prefect-db:5432/prefect"
+      PREFECT_SERVER_API_HOST: "0.0.0.0"
+      PREFECT_UI_API_URL: "${PREFECT_UI_API_URL}"
+    command: prefect server start --no-services
+    ports:
+      - "4200:4200"
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+    volumes:
+      - prefect-data:/root/.prefect
+    depends_on:
+      prefect-db:
+        condition: service_healthy
+    networks:
+      - app-network
+      - prefect-internal
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:4200/api/health', timeout=2)\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  prefect-services:
+    image: ${IMAGE_PREFECT:-prefecthq/prefect:3-latest}
+    container_name: prefect-services
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      PREFECT_API_URL: "http://prefect:4200/api"
+      PREFECT_API_DATABASE_CONNECTION_URL: "postgresql+asyncpg://nexus-prefect:${PREFECT_DB_PASSWORD}@prefect-db:5432/prefect"
+    command: prefect server services start
+    depends_on:
+      prefect:
+        condition: service_healthy
+    networks:
+      - prefect-internal
+
+  prefect-worker:
+    image: ${IMAGE_PREFECT:-prefecthq/prefect:3-latest}
+    container_name: prefect-worker
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      PREFECT_API_URL: "http://prefect:4200/api"
+    command: >
+      bash -c "
+        if [ -n \"$$GITEA_USERNAME\" ] && [ -n \"$$GITEA_PASSWORD\" ]; then
+          echo \"machine gitea login $$GITEA_USERNAME password $$GITEA_PASSWORD\" > ~/.netrc;
+          chmod 600 ~/.netrc;
+        fi;
+        if [ -n \"$$GITEA_REPO_URL\" ] && [ ! -d /flows/$$REPO_NAME/.git ]; then
+          if git clone \"$$GITEA_REPO_URL\" /flows/$$REPO_NAME; then
+            echo '[prefect-worker] Cloned Git repo into /flows/'$$REPO_NAME;
+          else
+            echo '[prefect-worker] Warning: Failed to clone '$$GITEA_REPO_URL >&2;
+          fi;
+        fi;
+        exec prefect worker start --pool local-pool
+      "
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+    volumes:
+      - prefect-flows:/flows
+    depends_on:
+      prefect:
+        condition: service_healthy
+    networks:
+      - app-network
+      - prefect-internal
+
+  prefect-db:
+    image: postgres:16-alpine
+    container_name: prefect-db
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      POSTGRES_USER: nexus-prefect
+      POSTGRES_PASSWORD: ${PREFECT_DB_PASSWORD}
+      POSTGRES_DB: prefect
+    volumes:
+      - prefect-db-data:/var/lib/postgresql/data
+    networks:
+      - prefect-internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nexus-prefect -d prefect"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  prefect-data:
+  prefect-db-data:
+  prefect-flows:
+
+networks:
+  app-network:
+    external: true
+  prefect-internal:
+    driver: bridge

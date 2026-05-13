@@ -1,0 +1,182 @@
+---
+import Layout from '../layouts/Layout.astro';
+---
+
+<Layout title="Category" activeNav="stacks">
+  <div class="category-header">
+    <h2 id="page-title">Loading...</h2>
+    <div id="category-description" class="category-description"></div>
+    <div id="category-stats" class="category-stats"></div>
+  </div>
+
+  <div id="services-grid" class="services-grid">
+    <div class="loading">Loading services...</div>
+  </div>
+</Layout>
+
+<style>
+  .category-header {
+    margin-bottom: 2rem;
+  }
+
+  .category-description {
+    color: var(--text-secondary);
+    font-size: 0.9rem;
+    line-height: 1.5;
+  }
+
+  .category-stats {
+    display: flex;
+    gap: 1.5rem;
+    margin-top: 1rem;
+    font-size: 0.85rem;
+  }
+
+  .category-stats :global(span) { color: var(--text-muted); }
+  .category-stats :global(.count-running) { color: var(--accent); }
+  .category-stats :global(.count-pending) { color: var(--warning); }
+
+  .card-name-section { flex: 1; }
+
+  .card-meta :global(span) {
+    display: flex;
+    align-items: center;
+    gap: 0.3rem;
+  }
+
+  @media (max-width: 768px) {
+    .category-header h2 { font-size: 1.3rem; }
+  }
+</style>
+
+<script is:inline>
+  const params = new URLSearchParams(window.location.search);
+  const categorySlug = params.get('cat');
+
+  function initPage() {
+    const cat = window.NS.CATEGORIES[categorySlug];
+    if (!cat) {
+      document.getElementById('page-title').textContent = 'Unknown Category';
+      document.getElementById('services-grid').innerHTML = '<div class="empty-state">Category not found. <a href="/stacks" style="color: var(--accent);">Back to Stacks</a></div>';
+      return;
+    }
+    document.title = cat.name + ' - Nexus Control Plane';
+    document.getElementById('page-title').textContent = cat.name;
+    document.getElementById('category-description').textContent = cat.description;
+    window.NS.fetchDomain().then(function() { loadServices(); });
+  }
+
+  async function loadServices() {
+    try {
+      const response = await fetch('/api/services?category=' + encodeURIComponent(categorySlug), { credentials: 'same-origin' });
+      if (!response.ok) {
+        document.getElementById('services-grid').innerHTML = '<div class="empty-state">Failed to load services (HTTP ' + response.status + '). Refresh the page to retry.</div>';
+        return;
+      }
+      const data = await response.json();
+      if (data.success) {
+        renderServices(data.services || []);
+      } else {
+        document.getElementById('services-grid').innerHTML = '<div class="empty-state">Failed to load services. Refresh the page to retry.</div>';
+      }
+    } catch (error) {
+      console.error('Failed to load services:', error);
+      document.getElementById('services-grid').innerHTML = '<div class="empty-state">Failed to load services. Refresh the page to retry.</div>';
+    }
+  }
+
+  function renderServices(services) {
+    const grid = document.getElementById('services-grid');
+    grid.innerHTML = '';
+
+    if (!services.length) {
+      grid.innerHTML = '<div class="empty-state">No services in this category.</div>';
+      return;
+    }
+
+    const total = services.length;
+    const running = services.filter(function(s) { return s.enabled && s.deployed; }).length;
+    const pending = services.filter(function(s) { return s.pending; }).length;
+
+    document.getElementById('category-stats').innerHTML =
+      '<span class="count-running">' + running + ' / ' + total + ' running</span>' +
+      (pending > 0 ? '<span class="count-pending">' + pending + ' pending</span>' : '');
+
+    services.forEach(function(service) {
+      const card = document.createElement('div');
+      card.className = 'service-card' + (service.pending ? ' pending' : '');
+      card.id = 'service-' + service.name;
+
+      const statusDotHtml = window.NS.renderStatusDot(service);
+
+      let badges = '';
+      if (service.core) badges += '<span class="badge badge-core">core</span>';
+      if (service.admin_only) badges += '<span class="badge badge-admin">admin</span>';
+      if (service.public) badges += '<span class="badge badge-public">public</span>';
+      if (!service.subdomain) badges += '<span class="badge badge-internal">internal</span>';
+      if (service.pending) {
+        badges += '<span class="badge badge-pending">' + (service.enabled ? 'will enable' : 'will disable') + '</span>';
+      }
+
+      const isDisabled = service.core || service.admin_only;
+      const toggleClass = 'toggle-switch' + (service.enabled ? ' active' : '') + (isDisabled ? ' disabled' : '');
+      const toggleTitle = service.core ? 'Core service - cannot be disabled' :
+                         service.admin_only ? 'Admin-only - managed via GitHub Actions' : '';
+      const desc = service.long_description || service.description || '';
+
+      let openHtml = '';
+      const url = window.NS.stackUrl(service);
+      if (url && service.deployed) {
+        openHtml = '<a href="' + escapeAttr(url) + '" target="_blank" rel="noopener" class="card-open-link">Open &#8599;</a>';
+      }
+
+      let websiteHtml = '';
+      if (service.website) {
+        try {
+          const wDomain = new URL(service.website).hostname.replace('www.', '');
+          websiteHtml = '<a href="' + escapeAttr(service.website) + '" target="_blank" rel="noopener" class="card-project-link">' + escapeHtml(wDomain) + '</a>';
+        } catch {}
+      }
+
+      card.innerHTML =
+        '<div class="card-header">' +
+          '<div class="card-name-section"><div class="card-name">' + statusDotHtml + ' ' + escapeHtml(service.name) + ' ' + badges + '</div></div>' +
+          '<div class="' + toggleClass + '" id="toggle-' + escapeAttr(service.name) + '" title="' + escapeAttr(toggleTitle) + '" data-service="' + escapeAttr(service.name) + '" data-target="' + (!service.enabled) + '"></div>' +
+        '</div>' +
+        '<div class="card-description">' + escapeHtml(desc) + '</div>' +
+        '<div class="card-footer"><div class="card-meta">' + websiteHtml + '</div>' + openHtml + '</div>';
+
+      const toggleEl = card.querySelector('.toggle-switch');
+      toggleEl.addEventListener('click', function() { handleToggle(this); });
+
+      grid.appendChild(card);
+    });
+
+    if (window.location.hash) {
+      const anchor = decodeURIComponent(window.location.hash.slice(1));
+      const el = document.getElementById('service-' + anchor);
+      if (el) {
+        el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        el.style.boxShadow = '0 0 20px rgba(0, 255, 136, 0.4)';
+        setTimeout(function() { el.style.boxShadow = ''; }, 2000);
+      }
+    }
+  }
+
+  async function handleToggle(toggleEl) {
+    if (toggleEl.classList.contains('disabled')) return;
+    const name = toggleEl.dataset.service;
+    const target = toggleEl.dataset.target === 'true';
+    toggleEl.classList.add('disabled');
+    const result = await window.NS.toggleService(name, target);
+    if (result.success) {
+      loadServices();
+    } else {
+      toggleEl.classList.remove('disabled');
+    }
+  }
+
+  window.NS.registerKeyboard({ searchInputId: null });
+
+  initPage();
+</script>

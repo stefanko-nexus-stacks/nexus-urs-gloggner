@@ -1,0 +1,63 @@
+# =============================================================================
+# code-server - VS Code in the Browser
+# =============================================================================
+# Access via: https://code.${domain}
+# Run VS Code on a remote server and access it through the browser for
+# consistent development environments accessible from any device.
+#
+# Note: Password authentication is disabled (--auth none) since Cloudflare
+# Access provides email OTP protection at the network level.
+#
+# Git Integration: If Gitea is enabled, the shared workspace repo is
+# auto-cloned and code-server opens directly in that folder.
+# =============================================================================
+
+services:
+  code-server:
+    build: .
+    image: ${IMAGE_CODE_SERVER:-nexus-code-server:latest}
+    container_name: code-server
+    restart: unless-stopped
+    entrypoint: >
+      bash -c "
+        if [ -n \"$$GITEA_USERNAME\" ] && [ -n \"$$GITEA_PASSWORD\" ]; then
+          echo \"machine gitea login $$GITEA_USERNAME password $$GITEA_PASSWORD\" > /home/coder/.netrc;
+          chmod 600 /home/coder/.netrc;
+        fi;
+        if [ -n \"$$GITEA_REPO_URL\" ] && [ ! -d /home/coder/$$REPO_NAME/.git ]; then
+          if git clone \"$$GITEA_REPO_URL\" /home/coder/$$REPO_NAME; then
+            echo '[code-server] Cloned Git repo into /home/coder/'$$REPO_NAME;
+          else
+            echo '[code-server] Warning: Failed to clone '$$GITEA_REPO_URL >&2;
+          fi;
+        fi;
+        OPEN_DIR=/home/coder;
+        if [ -d /home/coder/$$REPO_NAME ]; then OPEN_DIR=/home/coder/$$REPO_NAME; fi;
+        exec code-server --auth none --bind-addr 0.0.0.0:8080 $$OPEN_DIR
+      "
+    env_file:
+      - path: .env
+        required: false
+    ports:
+      - "8100:8080"
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+    volumes:
+      - code-server-data:/home/coder
+    networks:
+      - app-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8080/healthz || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  code-server-data:
+
+networks:
+  app-network:
+    external: true

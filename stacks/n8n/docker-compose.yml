@@ -1,0 +1,48 @@
+# =============================================================================
+# n8n - Workflow Automation Tool
+# https://n8n.${DOMAIN}
+# =============================================================================
+# n8n is a free and source-available workflow automation tool.
+# Login: Owner account created during first deployment
+# Note: Since n8n 1.0, basic auth is deprecated. Owner setup is required.
+# The setup page is protected by Cloudflare Access.
+# =============================================================================
+
+services:
+  n8n:
+    image: ${IMAGE_N8N:-n8nio/n8n:latest}
+    container_name: n8n
+    restart: unless-stopped
+    ports:
+      - "5678:5678"
+    environment:
+      - N8N_HOST=n8n.${DOMAIN}
+      - N8N_PORT=5678
+      - N8N_PROTOCOL=https
+      - WEBHOOK_URL=https://n8n.${DOMAIN}/
+      - GENERIC_TIMEZONE=Europe/Zurich
+      - TZ=Europe/Zurich
+      # Database (SQLite by default, can upgrade to PostgreSQL)
+      - DB_TYPE=sqlite
+      - DB_SQLITE_VACUUM_ON_STARTUP=true
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:5678/healthz || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    volumes:
+      - n8n_data:/home/node/.n8n
+    networks:
+      - app-network
+
+volumes:
+  n8n_data:
+
+networks:
+  app-network:
+    external: true

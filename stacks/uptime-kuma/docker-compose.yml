@@ -1,0 +1,36 @@
+# =============================================================================
+# Uptime Kuma - A fancy self-hosted monitoring tool
+# https://github.com/louislam/uptime-kuma
+# =============================================================================
+# Access via: https://uptime-kuma.your-domain.com
+# Default port: 3001
+# =============================================================================
+
+services:
+  uptime-kuma:
+    image: ${IMAGE_UPTIME_KUMA:-louislam/uptime-kuma:latest}
+    container_name: uptime-kuma
+    restart: unless-stopped
+    ports:
+      - "3001:3001"
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+    volumes:
+      - uptime_kuma_data:/app/data
+    networks:
+      - app-network
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:3001 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+networks:
+  app-network:
+    external: true
+
+volumes:
+  uptime_kuma_data:

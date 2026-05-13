@@ -1,0 +1,307 @@
+name: Teardown Nexus-Stack
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type "TEARDOWN" to confirm (keeps control plane)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: infrastructure
+  cancel-in-progress: false
+
+jobs:
+  teardown:
+    name: Teardown Hetzner Infrastructure
+    runs-on: ubuntu-latest
+    if: github.event.inputs.confirm == 'TEARDOWN'
+    env:
+      TF_VAR_cloudflare_api_token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      TF_VAR_cloudflare_account_id: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      TF_VAR_cloudflare_zone_id: ${{ secrets.CLOUDFLARE_ZONE_ID }}
+      TF_VAR_hcloud_token: ${{ secrets.HCLOUD_TOKEN }}
+      TF_VAR_domain: ${{ secrets.DOMAIN }}
+      TF_VAR_access_emails: ${{ secrets.ACCESS_EMAILS }}
+      TF_VAR_infisical_token: ${{ secrets.INFISICAL_TOKEN }}
+      TF_VAR_github_owner: ${{ github.repository_owner }}
+      TF_VAR_github_repo: ${{ github.event.repository.name }}
+
+    steps:
+      - name: Validate confirmation
+        run: |
+          if [ "${{ github.event.inputs.confirm }}" != "TEARDOWN" ]; then
+            echo "❌ Teardown cancelled. You must type 'TEARDOWN' to confirm."
+            exit 1
+          fi
+          echo "⚠️  TEARDOWN CONFIRMED"
+          echo "   This will:"
+          echo "   - Destroy Hetzner server and all Docker containers"
+          echo "   - Remove Cloudflare Tunnel to Hetzner"
+          echo "   - Keep the Control Plane active for re-deployment"
+
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Log teardown start
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          DOMAIN: ${{ secrets.DOMAIN }}
+        run: |
+          if [ -f .github/scripts/log-to-d1.sh ]; then
+            chmod +x .github/scripts/log-to-d1.sh
+            .github/scripts/log-to-d1.sh warn "Teardown workflow started"
+          fi
+
+      - name: Install OpenTofu
+        uses: opentofu/setup-opentofu@v2
+        with:
+          tofu_version: 1.10.0
+
+      - name: Install uv
+        # Required by the `nexus_deploy` Python package — the
+        # s3-snapshot step below runs `python -m nexus_deploy
+        # s3-snapshot` which lives in the Python package. Pinned
+        # to the same version spin-up.yml + python-tests use.
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "0.11.7"
+          enable-cache: true
+
+      - name: Sync nexus_deploy runtime deps
+        # Pre-resolve the lockfile-pinned runtime deps. `--no-dev`
+        # skips ruff/mypy/pytest since we only need runtime here.
+        run: uv sync --frozen --no-dev
+
+      - name: Install cloudflared
+        # Needed by the SSH-over-Cloudflare-Access setup in
+        # `nexus_deploy.pipeline.run_snapshot` (configure_ssh writes
+        # a Host block that uses ProxyCommand=cloudflared).
+        run: |
+          curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
+          chmod +x cloudflared
+          sudo mv cloudflared /usr/local/bin/
+
+      - name: Install SSH key from GitHub Secrets
+        # Teardown's pre-destroy s3-snapshot step needs SSH into the
+        # live server (docker exec pg_dump + rclone sync). Before
+        # RFC 0001, teardown.yml only did `tofu destroy` (provider
+        # API, no SSH needed) so the legacy step generated a fresh
+        # ephemeral key that was never registered on the server —
+        # fine for tofu, useless for ssh. With the snapshot step
+        # the SSH must actually work, so install the PERSISTENT
+        # key from secrets (the same key spin-up.yml uses), which
+        # is already present in the server's authorized_keys.
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          umask 077
+          if [ -z "${{ secrets.SSH_PRIVATE_KEY }}" ]; then
+            echo "❌ SSH_PRIVATE_KEY secret not set — teardown's s3-snapshot step needs SSH access to the live server."
+            echo "   Run the 'Initial Setup' workflow first to bootstrap the SSH key pair, or set SSH_PRIVATE_KEY manually."
+            exit 1
+          fi
+          # SSH key heredocs: expression placeholders must NOT start at column 0
+          # (breaks GitHub Actions YAML parser). Keep indented and strip leading
+          # whitespace with sed to ensure clean key content.
+          sed 's/^[[:space:]]*//' > ~/.ssh/id_ed25519 <<'EOF_PRIVATE_KEY'
+          ${{ secrets.SSH_PRIVATE_KEY }}
+          EOF_PRIVATE_KEY
+          chmod 600 ~/.ssh/id_ed25519
+          # Public key — from secret if available, derived from private otherwise.
+          if [ -n "${{ secrets.SSH_PUBLIC_KEY }}" ]; then
+            echo "${{ secrets.SSH_PUBLIC_KEY }}" > ~/.ssh/id_ed25519.pub
+          else
+            ssh-keygen -y -f ~/.ssh/id_ed25519 > ~/.ssh/id_ed25519.pub
+          fi
+          chmod 644 ~/.ssh/id_ed25519.pub
+          echo "✅ SSH key installed from secrets (matches server's authorized_keys)"
+
+      - name: Create R2 credentials from secrets
+        run: |
+          mkdir -p tofu
+
+          # Generate dynamic bucket name from domain
+          # Trim whitespace from secrets to avoid auth issues
+          R2_ACCESS_KEY_ID=$(echo -n "${{ secrets.R2_ACCESS_KEY_ID }}" | tr -d '[:space:]')
+          R2_SECRET_ACCESS_KEY=$(echo -n "${{ secrets.R2_SECRET_ACCESS_KEY }}" | tr -d '[:space:]')
+          BUCKET_NAME=$(echo "${{ secrets.DOMAIN }}" | tr '.' '-')-terraform-state
+          echo "📦 Using bucket: $BUCKET_NAME"
+
+          cat > tofu/.r2-credentials << EOF
+          R2_ACCESS_KEY_ID="${R2_ACCESS_KEY_ID}"
+          R2_SECRET_ACCESS_KEY="${R2_SECRET_ACCESS_KEY}"
+          EOF
+          sed -i 's/^          //' tofu/.r2-credentials
+
+          cat > tofu/backend.hcl << EOF
+          endpoints = {
+            s3 = "https://${{ secrets.CLOUDFLARE_ACCOUNT_ID }}.r2.cloudflarestorage.com"
+          }
+          bucket = "${BUCKET_NAME}"
+          EOF
+          sed -i 's/^          //' tofu/backend.hcl
+
+      - name: Generate config.tfvars
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          DOMAIN: ${{ secrets.DOMAIN }}
+        run: |
+          # Stack config (emails from secrets)
+          cat > tofu/stack/config.tfvars << EOF
+          server_type     = "${{ vars.SERVER_TYPE || 'cx43' }}"
+          server_location = "${{ vars.SERVER_LOCATION || 'hel1' }}"
+          server_image    = "ubuntu-24.04"
+          ssh_public_key_path  = "~/.ssh/id_ed25519.pub"
+          ssh_private_key_path = "~/.ssh/id_ed25519"
+          domain              = "${{ secrets.DOMAIN }}"
+          subdomain_separator = "${{ secrets.SUBDOMAIN_SEPARATOR || '.' }}"
+          admin_email         = "${{ secrets.TF_VAR_admin_email }}"
+          user_email          = "${{ secrets.TF_VAR_user_email }}"
+          admin_username      = "admin"
+          github_owner        = "${{ github.repository_owner }}"
+          github_repo         = "${{ github.event.repository.name }}"
+          EOF
+          sed -i 's/^          //' tofu/stack/config.tfvars
+
+          # RFC 0001 cutover: persistent_volume_id is gone — Hetzner
+          # volumes are no longer used; persistence lives in R2.
+
+          # Read services from D1 (single source of truth)
+          echo "📋 Reading services from D1..."
+          D1_DATABASE_NAME="nexus-${DOMAIN//./-}-db"
+          ENABLED_SERVICES=$(npx wrangler@4 d1 execute "$D1_DATABASE_NAME" --remote --json \
+            --command "SELECT name FROM services WHERE enabled = 1" 2>/dev/null \
+            | jq -r '.[0].results | map(.name) | join(",")' 2>/dev/null || echo "")
+
+          if [ -n "$ENABLED_SERVICES" ]; then
+            echo "📋 Enabled services from D1: $ENABLED_SERVICES"
+          else
+            echo "📋 No services in D1 yet - core services will be enabled by default"
+          fi
+
+          # Generate services config from services.yaml
+          # Use shared script (same as spin-up.yml)
+          chmod +x .github/scripts/generate-services-tfvars.py
+          ENABLED_SERVICES="$ENABLED_SERVICES" python3 .github/scripts/generate-services-tfvars.py
+
+      - name: Initialize OpenTofu
+        run: |
+          cd tofu/stack
+          source ../.r2-credentials
+          export AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID"
+          export AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
+          tofu init -backend-config=../backend.hcl
+
+      - name: Snapshot persistent state to R2 (atomic, pre-destroy)
+        # RFC 0001 PR-4 — atomicity contract: when the
+        # NEXUS_S3_PERSISTENCE flag is on, push the current state to
+        # R2 BEFORE tofu destroy. Any failure aborts the teardown
+        # (rc=2) so destroy never runs against an unverified
+        # snapshot. When the flag is off the step is a fast no-op
+        # (rc=0) — backwards-compatible for stacks still on the
+        # volume-mount path.
+        env:
+          # Feature flag — exact "true" opts in. Defaults to "true"
+          # symmetric to spin-up.yml: a tenant on the post-cutover
+          # path that forgot to set the secret would otherwise have
+          # snapshot skipped (rc=0) and proceed to `tofu destroy` →
+          # data loss. The `|| 'true'` fallback closes that footgun;
+          # set the secret explicitly to anything else to bypass.
+          NEXUS_S3_PERSISTENCE: ${{ secrets.NEXUS_S3_PERSISTENCE || 'true' }}
+          # R2 persistence-bucket coords — derived from already-
+          # existing secrets (see spin-up.yml for the same wiring +
+          # rationale). No new operator-set secret needed.
+          PERSISTENCE_S3_ENDPOINT: https://${{ secrets.CLOUDFLARE_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          PERSISTENCE_S3_REGION: auto
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          # Manifest fields — bucket-name slug + release tag.
+          PERSISTENCE_STACK_SLUG: ${{ secrets.PERSISTENCE_STACK_SLUG || github.event.repository.name }}
+          PERSISTENCE_TEMPLATE_VERSION: ${{ github.ref_name }}
+        run: |
+          # See spin-up.yml's matching step for the rationale.
+          DOMAIN_SLUG=$(echo "${{ secrets.DOMAIN }}" | tr '.' '-')
+          export PERSISTENCE_S3_BUCKET="nexus-${DOMAIN_SLUG}-persistence"
+
+          # Lowercase PERSISTENCE_STACK_SLUG — the env-var value
+          # from the step's env: block falls back to
+          # github.event.repository.name (e.g. "Nexus-Stack" with
+          # a capital N), but the s3_persistence validator enforces
+          # S3 bucket-name shape on the slug (lowercase only).
+          # GitHub Actions has no lowercase filter on workflow-
+          # expression interpolations, so the cast happens here in
+          # the shell before the subcommand runs.
+          PERSISTENCE_STACK_SLUG=$(echo "$PERSISTENCE_STACK_SLUG" | tr '[:upper:]' '[:lower:]')
+          export PERSISTENCE_STACK_SLUG
+
+          uv run --quiet --project "$GITHUB_WORKSPACE" \
+            python -m nexus_deploy s3-snapshot
+
+      - name: Teardown Hetzner infrastructure only
+        run: |
+          cd tofu/stack
+          source ../.r2-credentials
+          export AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID"
+          export AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
+
+          # Destroy all resources in nexus-stack state
+          # Control Plane is now in separate state (tofu/control-plane/)
+          tofu destroy -var-file=config.tfvars -auto-approve
+
+      - name: Confirm teardown
+        run: |
+          echo ""
+          echo "💤 Infrastructure torn down:"
+          echo "   ✗ Hetzner Cloud server - DESTROYED"
+          echo "   ✗ Cloudflare Tunnel - DESTROYED"
+          echo "   ✓ Control Plane - STILL ACTIVE"
+          echo "   ✓ R2 State Bucket - PRESERVED"
+          echo ""
+          echo "📋 Visit the Control Plane to re-deploy:"
+          echo "   https://control.${{ secrets.DOMAIN }}"
+
+      - name: Write teardown timestamp to D1
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          echo "📝 Writing teardown timestamp to D1..."
+
+          # Get D1 database name - need to init control-plane state first
+          cd tofu/control-plane
+          source ../.r2-credentials
+          export AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID"
+          export AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
+          tofu init -backend-config=../backend.hcl -backend-config="key=control-plane.tfstate" -input=false
+          D1_DATABASE_NAME=$(tofu output -raw d1_database_name 2>/dev/null || echo "")
+          cd ../..
+
+          if [ -z "$D1_DATABASE_NAME" ]; then
+            echo "⚠️  Could not get D1 database name - skipping timestamp write"
+            exit 0
+          fi
+
+          npx wrangler@4 d1 execute "$D1_DATABASE_NAME" --remote --command "INSERT OR REPLACE INTO config (key, value, updated_at) VALUES ('last_teardown', datetime('now'), datetime('now'))"
+          echo "✅ Teardown timestamp written to D1"
+
+          # Reset all firewall rules to disabled (ports must be explicitly re-opened)
+          echo "🔥 Resetting firewall rules..."
+          npx wrangler@4 d1 execute "$D1_DATABASE_NAME" --remote --command "UPDATE firewall_rules SET enabled = 0, deployed = 0, updated_at = datetime('now')" 2>/dev/null || true
+          echo "✅ Firewall rules reset - all ports closed for next Spin Up"
+
+      - name: Log teardown completed
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          DOMAIN: ${{ secrets.DOMAIN }}
+        run: |
+          if [ -f .github/scripts/log-to-d1.sh ]; then
+            .github/scripts/log-to-d1.sh info "Teardown workflow completed"
+          fi

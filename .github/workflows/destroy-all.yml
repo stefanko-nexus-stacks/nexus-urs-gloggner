@@ -1,0 +1,409 @@
+name: Destroy All Infrastructure
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type "DESTROY" (uppercase) to confirm FULL destruction'
+        required: true
+        type: string
+      delete_data:
+        # Opt-in extra step that wipes the R2 buckets after tofu
+        # destroy: persistence (snapshots), data (datalake), and
+        # state (tofu state) buckets. Without this, those buckets
+        # survive destroy-all so a later initial-setup + spin-up
+        # reattaches to existing snapshot history (RFC 0001 decision
+        # #6). Setting this to "DESTROY" turns destroy-all into a
+        # true one-shot wipe.
+        description: 'Type "DESTROY" to ALSO wipe R2 buckets (snapshots + data + tofu state). Leave empty to preserve them.'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: infrastructure
+  cancel-in-progress: false
+
+jobs:
+  destroy:
+    name: Destroy All Nexus-Stack Resources
+    runs-on: ubuntu-latest
+    if: github.event.inputs.confirm == 'DESTROY'
+    env:
+      TF_VAR_cloudflare_api_token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      TF_VAR_cloudflare_account_id: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      TF_VAR_cloudflare_zone_id: ${{ secrets.CLOUDFLARE_ZONE_ID }}
+      TF_VAR_hcloud_token: ${{ secrets.HCLOUD_TOKEN }}
+      TF_VAR_domain: ${{ secrets.DOMAIN }}
+      TF_VAR_access_emails: ${{ secrets.ACCESS_EMAILS }}
+      TF_VAR_infisical_token: ${{ secrets.INFISICAL_TOKEN }}
+      TF_VAR_github_owner: ${{ github.repository_owner }}
+      TF_VAR_github_repo: ${{ github.event.repository.name }}
+      TF_VAR_hetzner_object_storage_access_key: ${{ secrets.HETZNER_OBJECT_STORAGE_ACCESS_KEY }}
+      TF_VAR_hetzner_object_storage_secret_key: ${{ secrets.HETZNER_OBJECT_STORAGE_SECRET_KEY }}
+      TF_VAR_external_s3_endpoint: ${{ secrets.EXTERNAL_S3_ENDPOINT }}
+      TF_VAR_external_s3_region: ${{ secrets.EXTERNAL_S3_REGION || 'auto' }}
+      TF_VAR_external_s3_access_key: ${{ secrets.EXTERNAL_S3_ACCESS_KEY }}
+      TF_VAR_external_s3_secret_key: ${{ secrets.EXTERNAL_S3_SECRET_KEY }}
+      TF_VAR_external_s3_bucket: ${{ secrets.EXTERNAL_S3_BUCKET }}
+      TF_VAR_external_s3_label: ${{ secrets.EXTERNAL_S3_LABEL }}
+      TF_VAR_r2_data_access_key: ${{ secrets.R2_DATA_ACCESS_KEY_ID || secrets.R2_ACCESS_KEY_ID }}
+      TF_VAR_r2_data_secret_key: ${{ secrets.R2_DATA_SECRET_ACCESS_KEY || secrets.R2_SECRET_ACCESS_KEY }}
+      TF_VAR_r2_data_bucket: ${{ secrets.R2_DATA_BUCKET }}
+
+    steps:
+      - name: Validate confirmation
+        run: |
+          if [ "${{ github.event.inputs.confirm }}" != "DESTROY" ]; then
+            echo "❌ Destruction cancelled. You must type 'DESTROY' (uppercase) to confirm."
+            exit 1
+          fi
+          echo "⚠️  DESTRUCTION CONFIRMED - This will delete ALL infrastructure and state!"
+
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install OpenTofu
+        uses: opentofu/setup-opentofu@v2
+        with:
+          tofu_version: 1.10.0
+
+      - name: Generate SSH key for OpenTofu
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -N "" -C "github-actions@nexus-stack"
+          chmod 600 ~/.ssh/id_ed25519
+          chmod 644 ~/.ssh/id_ed25519.pub
+
+      - name: Create R2 credentials from secrets
+        run: |
+          mkdir -p tofu tofu/control-plane tofu/stack
+
+          # Generate dynamic bucket name from domain
+          BUCKET_NAME=$(echo "${{ secrets.DOMAIN }}" | tr '.' '-')-terraform-state
+          echo "📦 Using bucket: $BUCKET_NAME"
+
+          cat > tofu/.r2-credentials << EOF
+          R2_ACCESS_KEY_ID="${{ secrets.R2_ACCESS_KEY_ID }}"
+          R2_SECRET_ACCESS_KEY="${{ secrets.R2_SECRET_ACCESS_KEY }}"
+          EOF
+
+          cat > tofu/backend.hcl << EOF
+          endpoints = {
+            s3 = "https://${{ secrets.CLOUDFLARE_ACCOUNT_ID }}.r2.cloudflarestorage.com"
+          }
+          bucket = "${BUCKET_NAME}"
+          EOF
+
+      - name: Generate config.tfvars
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          DOMAIN: ${{ secrets.DOMAIN }}
+        run: |
+          # Stack config (emails from secrets)
+          cat > tofu/stack/config.tfvars << EOF
+          server_type     = "${{ vars.SERVER_TYPE || 'cx43' }}"
+          server_location = "${{ vars.SERVER_LOCATION || 'hel1' }}"
+          server_image    = "ubuntu-24.04"
+          ssh_public_key_path  = "~/.ssh/id_ed25519.pub"
+          ssh_private_key_path = "~/.ssh/id_ed25519"
+          domain              = "${{ secrets.DOMAIN }}"
+          subdomain_separator = "${{ secrets.SUBDOMAIN_SEPARATOR || '.' }}"
+          admin_email         = "${{ secrets.TF_VAR_admin_email }}"
+          user_email          = "${{ secrets.TF_VAR_user_email }}"
+          admin_username      = "admin"
+          github_owner        = "${{ github.repository_owner }}"
+          github_repo         = "${{ github.event.repository.name }}"
+          EOF
+
+          # Read services from D1 (single source of truth)
+          echo "📋 Reading services from D1..."
+          D1_DATABASE_NAME="nexus-${DOMAIN//./-}-db"
+          ENABLED_SERVICES=$(npx wrangler@4 d1 execute "$D1_DATABASE_NAME" --remote --json \
+            --command "SELECT name FROM services WHERE enabled = 1" 2>/dev/null \
+            | jq -r '.[0].results | map(.name) | join(",")' 2>/dev/null || echo "")
+
+          if [ -n "$ENABLED_SERVICES" ]; then
+            echo "📋 Enabled services from D1: $ENABLED_SERVICES"
+          else
+            echo "📋 No services in D1 yet - core services will be enabled by default"
+          fi
+
+          # Generate services config from services.yaml
+          # Use shared script to avoid code duplication
+          chmod +x .github/scripts/generate-services-tfvars.py
+          ENABLED_SERVICES="$ENABLED_SERVICES" python3 .github/scripts/generate-services-tfvars.py
+
+          # Control Plane config
+          cat > tofu/control-plane/config.tfvars << EOF
+          server_type         = "${{ vars.SERVER_TYPE || 'cx43' }}"
+          server_location     = "${{ vars.SERVER_LOCATION || 'hel1' }}"
+          domain              = "${{ secrets.DOMAIN }}"
+          subdomain_separator = "${{ secrets.SUBDOMAIN_SEPARATOR || '.' }}"
+          admin_email         = "${{ secrets.TF_VAR_admin_email }}"
+          user_email          = "${{ secrets.TF_VAR_user_email }}"
+          github_owner        = "${{ github.repository_owner }}"
+          github_repo         = "${{ github.event.repository.name }}"
+          EOF
+
+      - name: Initialize OpenTofu for both states
+        run: |
+          source tofu/.r2-credentials
+          export AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID"
+          export AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
+
+          # Skip if R2 credentials are empty (already cleaned up by previous destroy)
+          if [ -z "$R2_ACCESS_KEY_ID" ] || [ -z "$R2_SECRET_ACCESS_KEY" ]; then
+            echo "⚠️  R2 credentials not found — infrastructure may already be destroyed"
+            echo "   Run initial-setup to re-deploy, or delete remaining resources manually"
+            echo "SKIP_TOFU_DESTROY=true" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          # Initialize Nexus Stack state
+          cd tofu/stack
+          INIT_OUTPUT=$(tofu init -backend-config=../backend.hcl 2>&1) && INIT_OK=true || INIT_OK=false
+          if [ "$INIT_OK" = "false" ]; then
+            if echo "$INIT_OUTPUT" | grep -qi "NoSuchBucket\|bucket does not exist"; then
+              echo "⚠️  R2 state bucket not found — state already empty, skipping destroy"
+              echo "SKIP_TOFU_DESTROY=true" >> "$GITHUB_ENV"
+              exit 0
+            else
+              echo "❌ Failed to initialize Nexus Stack backend:"
+              echo "$INIT_OUTPUT"
+              exit 1
+            fi
+          fi
+          echo "✅ Nexus Stack backend initialized"
+
+          # Initialize Control Plane state
+          cd ../control-plane
+          INIT_OUTPUT=$(tofu init -backend-config=../backend.hcl 2>&1) && INIT_OK=true || INIT_OK=false
+          if [ "$INIT_OK" = "false" ]; then
+            if echo "$INIT_OUTPUT" | grep -qi "NoSuchBucket\|bucket does not exist"; then
+              echo "⚠️  R2 state bucket not found — state already empty, skipping destroy"
+              echo "SKIP_TOFU_DESTROY=true" >> "$GITHUB_ENV"
+              exit 0
+            else
+              echo "❌ Failed to initialize Control Plane backend:"
+              echo "$INIT_OUTPUT"
+              exit 1
+            fi
+          fi
+          echo "✅ Control Plane backend initialized"
+          cd ../..
+          # RFC 0001 cutover: persistent_volume_id no longer exists.
+          # Hetzner volumes were replaced by R2-backed snapshots.
+
+      - name: Destroy Nexus Stack infrastructure
+        if: env.SKIP_TOFU_DESTROY != 'true'
+        run: |
+          cd tofu/stack
+          source ../.r2-credentials
+          export AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID"
+          export AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
+
+          echo "🗑️  Destroying Nexus Stack (Server, Tunnel, Services)..."
+          if ! tofu destroy -var-file=config.tfvars -auto-approve; then
+            echo "❌ ERROR: Failed to destroy Nexus Stack infrastructure"
+            echo "   Resources may still be running in Hetzner Cloud - check logs above"
+            exit 1
+          fi
+          echo "✅ Nexus Stack destroyed successfully"
+
+      - name: Destroy Control Plane infrastructure
+        if: env.SKIP_TOFU_DESTROY != 'true'
+        run: |
+          cd tofu/control-plane
+          source ../.r2-credentials
+          export AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID"
+          export AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
+
+          # RFC 0001 cutover: hcloud_volume.persistent no longer
+          # exists; persistence migrated to R2.
+          #
+          # The `nexus-<domain-slug>-persistence` R2 bucket holding
+          # snapshots is INTENTIONALLY NOT touched by destroy-all
+          # — it lives outside Tofu state (created by
+          # setup-control-plane.yaml + init-r2-state.sh via direct
+          # Cloudflare API calls). That means after destroy-all,
+          # the bucket survives with all its snapshot trees + the
+          # latest.txt pointer. Re-running initial-setup +
+          # spin-up later picks them back up via restore_from_s3.
+          #
+          # To wipe these too, re-run destroy-all with the
+          # `delete_data=DESTROY` workflow input — the
+          # "Delete R2 buckets" step at the end of this workflow
+          # handles persistence + data + state buckets in one
+          # shot. The standalone `scripts/cleanup-s3-bucket.sh`
+          # still exists for manual single-bucket cleanup.
+
+          # Protect KV namespace from destruction (keeps Databricks config etc.)
+          echo "💾 Protecting KV namespace from destroy..."
+          tofu state rm cloudflare_workers_kv_namespace.config 2>/dev/null || true
+
+          # Protect ALL Hetzner S3 buckets from destruction (keeps student data)
+          # Uses dynamic discovery so new buckets are automatically covered
+          echo "💾 Protecting Hetzner S3 buckets from destroy..."
+          for RESOURCE in $(tofu state list 2>/dev/null | grep '^minio_s3_bucket\.' || true); do
+            echo "   Removing $RESOURCE from state..."
+            tofu state rm "$RESOURCE" 2>/dev/null || true
+          done
+
+          echo "🗑️  Destroying Control Plane (Pages, Worker, DNS)..."
+          if ! tofu destroy -var-file=config.tfvars -auto-approve; then
+            echo "❌ ERROR: Failed to destroy Control Plane infrastructure"
+            echo "   Resources may still exist in Cloudflare - check logs above"
+            exit 1
+          fi
+          echo "✅ Control Plane destroyed successfully"
+
+      # Note: Hetzner S3 buckets are intentionally preserved (student data).
+      # They are re-imported into Terraform state on the next initial-setup.
+
+      # Note: R2 state bucket, credentials, and API token are intentionally
+      # preserved so that destroy-all can be re-run safely. The Terraform
+      # state files inside the bucket are stale after destroy but harmless —
+      # init-r2-state.sh reuses the bucket on next initial-setup.
+      #
+      # To wipe them too, run with `delete_data=DESTROY` — handled by
+      # the next step.
+
+      - name: Delete R2 buckets (opt-in via delete_data=DESTROY)
+        # Optional second destructive step that wipes the R2 buckets
+        # destroy-all otherwise preserves. Runs ONLY when the
+        # operator explicitly opts in via the `delete_data` input,
+        # mirroring the same `confirm`-must-equal-DESTROY pattern
+        # the script-level cleanup-s3-bucket.sh uses.
+        #
+        # Three buckets to wipe (in dependency order):
+        #  1. Persistence bucket (`nexus-<slug>-persistence`) —
+        #     holds the snapshot history; without this they survive
+        #     destroy-all by design (RFC 0001 decision #6).
+        #  2. Data bucket (`nexus-<slug>-data`) — the datalake;
+        #     services have already been destroyed by the steps
+        #     above, so safe to wipe.
+        #  3. Tofu state bucket (`<slug>-terraform-state`) — holds
+        #     the (now-empty) state files. Wiped LAST because
+        #     tofu init may have re-touched it during the destroy
+        #     steps above.
+        #
+        # Each bucket is wiped via `aws s3 rb --force` against the
+        # R2 S3-API endpoint, with the same R2 credentials the
+        # rest of the workflow already uses.
+        if: github.event.inputs.delete_data == 'DESTROY'
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          DOMAIN: ${{ secrets.DOMAIN }}
+          # Project supports custom data-bucket names via the
+          # R2_DATA_BUCKET secret (see setup-control-plane.yaml's
+          # custom-bucket-preservation logic). When the secret is
+          # unset we fall back to the convention nexus-<slug>-data.
+          # Without this, an operator who set a non-default bucket
+          # name would have the wipe step silently skip their real
+          # data bucket — and possibly delete a stale bucket living
+          # at the default name.
+          R2_DATA_BUCKET: ${{ secrets.R2_DATA_BUCKET }}
+        run: |
+          set -euo pipefail
+          source tofu/.r2-credentials
+          export AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID"
+          export AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
+          # R2's signing requires `region=auto`; without it the aws
+          # CLI defaults to its profile's region (or us-east-1) and
+          # R2 rejects the signature with an unhelpful 403.
+          export AWS_DEFAULT_REGION=auto
+          ENDPOINT="https://${CLOUDFLARE_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          DOMAIN_SLUG=$(echo "$DOMAIN" | tr '.' '-')
+          # Use the configured data-bucket name when set; fall back
+          # to the default convention otherwise. Mirrors what
+          # spin-up.yml + setup-control-plane.yaml already do.
+          DATA_BUCKET="${R2_DATA_BUCKET:-nexus-${DOMAIN_SLUG}-data}"
+
+          echo "🔥 delete_data=DESTROY — wiping R2 buckets"
+          echo "   endpoint: $ENDPOINT"
+
+          # Single source-of-truth for bucket existence: read the
+          # complete list of buckets in the R2 account ONCE, then
+          # decide skip-or-wipe via set-membership lookup. This
+          # eliminates the per-bucket head-bucket probe entirely
+          # and with it a whole class of "did this fail because
+          # the bucket doesn't exist, or for a transient reason?"
+          # ambiguities (network blip, per-bucket policy mismatch,
+          # 429 rate-limit, etc.). If list-buckets itself fails →
+          # fail loud here, no buckets touched. Same data-safety
+          # contract as the s3_persistence round-6 reachability
+          # probe.
+          if ! EXISTING_BUCKETS_RAW=$(aws --endpoint-url="$ENDPOINT" s3api list-buckets --query 'Buckets[].Name' --output text 2>&1); then
+            echo "  ❌ ERROR: cannot list R2 buckets — $EXISTING_BUCKETS_RAW"
+            echo "     (check R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY / endpoint / region)"
+            echo "     No buckets wiped — fix credentials and re-run."
+            exit 1
+          fi
+          # Normalize to one-bucket-per-line. ``aws --output text``
+          # with a list-of-strings query yields TAB-separated values
+          # (sometimes mixed with newlines); without explicit
+          # normalization the downstream membership check would
+          # rely on bash's default-IFS splitting trick — works by
+          # accident, but is fragile and easy to break by future
+          # edits. Explicit ``tr`` makes the separator obvious;
+          # ``grep -xF`` below pins an exact whole-line match so
+          # a bucket name that's a substring of another can't
+          # false-positive.
+          EXISTING_BUCKETS=$(printf '%s\n' "$EXISTING_BUCKETS_RAW" | tr '[:space:]' '\n' | grep -v '^$' || true)
+          BUCKET_COUNT=$(printf '%s\n' "$EXISTING_BUCKETS" | grep -c . || true)
+          echo "  ✓ R2 reachable; account has ${BUCKET_COUNT} bucket(s)"
+
+          for BUCKET in \
+            "nexus-${DOMAIN_SLUG}-persistence" \
+            "$DATA_BUCKET" \
+            "${DOMAIN_SLUG}-terraform-state"; do
+            # Exact whole-line match via ``grep -xF``: ``-x`` rules
+            # out substring matches (so e.g. ``nexus-foo`` can't
+            # match ``nexus-foo-data``), ``-F`` treats the bucket
+            # name literally (so dots/hyphens aren't regex
+            # metacharacters).
+            if printf '%s\n' "$EXISTING_BUCKETS" | grep -qxF "$BUCKET"; then
+              echo "  → wiping $BUCKET ..."
+              # `s3 rb --force` empties then removes the bucket.
+              if ! aws --endpoint-url="$ENDPOINT" s3 rb "s3://$BUCKET" --force; then
+                echo "  ❌ ERROR: failed to delete $BUCKET — bucket may still hold objects"
+                echo "     Manual cleanup: AWS_DEFAULT_REGION=auto aws --endpoint-url=$ENDPOINT s3 rb s3://$BUCKET --force"
+                exit 1
+              fi
+              echo "  ✅ $BUCKET deleted"
+            else
+              echo "  (skip: $BUCKET not in account)"
+            fi
+          done
+          echo "✅ All R2 buckets wiped"
+
+      - name: Confirm destruction
+        run: |
+          echo ""
+          echo "🗑️  All infrastructure has been destroyed:"
+          echo "   - Hetzner Cloud server"
+          echo "   - Cloudflare Tunnel"
+          echo "   - Cloudflare DNS records"
+          echo "   - Cloudflare Access policies"
+          echo "   - Control Plane (Pages + Worker + D1)"
+          echo "   - Hetzner Object Storage buckets (LakeFS, General)"
+          if [ "${{ github.event.inputs.delete_data }}" = "DESTROY" ]; then
+            echo "   - R2 persistence bucket (snapshots) — wiped via delete_data=DESTROY"
+            echo "   - R2 datalake bucket — wiped via delete_data=DESTROY"
+            echo "   - R2 tofu state bucket — wiped via delete_data=DESTROY"
+          else
+            echo ""
+            echo "   Preserved (reused on next initial-setup):"
+            echo "   - R2 state bucket and credentials"
+            echo "   - R2 datalake bucket and credentials"
+            echo "   - R2 persistence bucket (snapshots)"
+            echo ""
+            echo "   To wipe these too, re-run with delete_data=DESTROY."
+          fi
+          echo ""
+          echo "To redeploy, run the Initial Setup workflow."
