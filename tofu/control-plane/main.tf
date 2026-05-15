@@ -3,7 +3,7 @@
 # =============================================================================
 # This creates the control plane infrastructure on Cloudflare.
 # It survives "teardown" but is destroyed on "destroy-all".
-# 
+#
 # Uses Cloudflare Pages Functions for the API (no separate Worker needed).
 # Environment variables are set via wrangler or Cloudflare dashboard.
 # =============================================================================
@@ -59,16 +59,6 @@ resource "cloudflare_workers_script" "scheduled_teardown" {
   plain_text_binding {
     name = "DOMAIN"
     text = var.domain
-  }
-
-  plain_text_binding {
-    name = "BASE_DOMAIN"
-    text = var.base_domain
-  }
-
-  plain_text_binding {
-    name = "BASE_DOMAIN"
-    text = var.base_domain
   }
 
   # BASE_DOMAIN is the Resend-verified parent domain used as the email
@@ -180,8 +170,6 @@ resource "cloudflare_pages_project" "control_plane" {
         GITHUB_OWNER                = var.github_owner
         GITHUB_REPO                 = var.github_repo
         DOMAIN                      = var.domain
-        BASE_DOMAIN                  = var.base_domain
-        BASE_DOMAIN                  = var.base_domain
         ADMIN_EMAIL                 = var.admin_email
         USER_EMAIL                  = var.user_email
         SERVER_TYPE                 = var.server_type
@@ -337,9 +325,3 @@ resource "minio_s3_bucket" "pgducklake" {
 # live state to R2 before destroy. See:
 #   - src/nexus_deploy/s3_persistence.py  (rendering)
 #   - src/nexus_deploy/s3_restore.py      (orchestration)
-#   - .github/workflows/migrate-volume-to-r2.yml (one-off evacuation)
-#
-# Removing the resource here means the next `tofu apply` destroys
-# the existing volume. For tenants with live data, run the migration
-# workflow BEFORE merging the cutover PR (it snapshots the still-
-# mounted volume into R2 so spinup can restore from there).

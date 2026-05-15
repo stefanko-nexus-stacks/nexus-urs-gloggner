@@ -4,7 +4,7 @@
 
 output "control_plane_url" {
   description = "Control Plane URL"
-  value       = "https://control-urs-gloggner.nona.company"
+  value       = "https://control.${var.domain}"
 }
 
 output "pages_project_name" {

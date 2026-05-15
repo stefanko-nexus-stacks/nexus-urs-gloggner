@@ -1,6 +1,6 @@
 # =============================================================================
 # SFTPGo - SFTP/SCP server with R2 backend
-# Web admin: https://sftpgo-urs-gloggner.nona.company
+# Web admin: https://sftpgo.${DOMAIN}
 # SFTP:      sftp://<user>@<server-ip>:2022   (after firewall opt-in via Control Plane)
 # =============================================================================
 # SFTPGo gives external tools (CDC pipelines, BI exports, partner-data

@@ -512,27 +512,27 @@ resource "hcloud_server" "main" {
   user_data = <<-EOT
     #!/bin/bash
     set -e
-    
+
     # Update system
     apt-get update && apt-get upgrade -y
-    
+
     # Install Docker
     curl -fsSL https://get.docker.com | sh
     command -v docker >/dev/null 2>&1 || { echo "FATAL: Docker installation failed" >&2; exit 1; }
 
     # Install security tools
     apt-get install -y fail2ban unattended-upgrades jq
-    
+
     # Configure automatic security updates
     cat > /etc/apt/apt.conf.d/20auto-upgrades << 'EOF'
     APT::Periodic::Update-Package-Lists "1";
     APT::Periodic::Unattended-Upgrade "1";
     APT::Periodic::AutocleanInterval "7";
     EOF
-    
+
     systemctl enable fail2ban unattended-upgrades
     systemctl start fail2ban unattended-upgrades
-    
+
     # Detect architecture and install cloudflared
     ARCH=$(dpkg --print-architecture)
     if [ "$ARCH" = "arm64" ]; then
@@ -547,10 +547,10 @@ resource "hcloud_server" "main" {
 
     # Create app directories
     mkdir -p /opt/docker-server/stacks
-    
+
     # Create Docker network
     docker network create app-network || true
-    
+
     # Signal completion
     touch /opt/docker-server/.setup-complete
   EOT
@@ -607,7 +607,7 @@ resource "cloudflare_zero_trust_tunnel_cloudflared_config" "main" {
   config {
     # SSH access
     ingress_rule {
-      hostname = "ssh-urs-gloggner.nona.company"
+      hostname = "ssh.${var.domain}"
       service  = "ssh://localhost:22"
     }
 
@@ -615,7 +615,7 @@ resource "cloudflare_zero_trust_tunnel_cloudflared_config" "main" {
     dynamic "ingress_rule" {
       for_each = local.enabled_services_with_subdomain
       content {
-        hostname = "${ingress_rule.value.subdomain}-urs-gloggner.nona.company"
+        hostname = "${ingress_rule.value.subdomain}.${var.domain}"
         service  = "http://localhost:${ingress_rule.value.port}"
       }
     }
@@ -633,7 +633,7 @@ resource "cloudflare_zero_trust_tunnel_cloudflared_config" "main" {
 
 resource "cloudflare_record" "ssh" {
   zone_id = var.cloudflare_zone_id
-  name    = "ssh-urs-gloggner"
+  name    = "ssh"
   content = "${cloudflare_zero_trust_tunnel_cloudflared.main.id}.cfargotunnel.com"
   type    = "CNAME"
   proxied = true
@@ -647,7 +647,7 @@ resource "cloudflare_record" "services" {
   depends_on = [cloudflare_zero_trust_tunnel_cloudflared_config.main]
 
   zone_id = var.cloudflare_zone_id
-  name    = "${each.value.subdomain}-urs-gloggner"
+  name    = each.value.subdomain
   content = "${cloudflare_zero_trust_tunnel_cloudflared.main.id}.cfargotunnel.com"
   type    = "CNAME"
   proxied = true
@@ -671,7 +671,7 @@ resource "cloudflare_record" "firewall_tcp" {
   for_each = var.ipv6_only ? {} : local.firewall_dns_records
 
   zone_id = var.cloudflare_zone_id
-  name    = "${each.value.dns_record}-urs-gloggner"
+  name    = each.value.dns_record
   content = hcloud_server.main.ipv4_address
   type    = "A"
   proxied = false
@@ -686,7 +686,7 @@ resource "cloudflare_record" "firewall_tcp" {
 resource "cloudflare_zero_trust_access_application" "ssh" {
   zone_id          = var.cloudflare_zone_id
   name             = "${local.resource_prefix} SSH"
-  domain           = "ssh-urs-gloggner.nona.company"
+  domain           = "ssh.${var.domain}"
   type             = "ssh"
   session_duration = "1h"
 }
@@ -759,7 +759,7 @@ resource "cloudflare_zero_trust_access_application" "services" {
 
   zone_id = var.cloudflare_zone_id
   name    = "${local.resource_prefix} ${title(each.key)}"
-  domain  = "${each.value.subdomain}-urs-gloggner.nona.company"
+  domain  = "${each.value.subdomain}.${var.domain}"
   type    = "self_hosted"
   # Wetty uses shorter session duration (1h) for enhanced security
   # Other services use 24h for better user experience
