@@ -1,6 +1,6 @@
 # =============================================================================
 # Marimo - Reactive Python Notebook with Spark Connect
-# https://marimo-urs-gloggner.nona.company
+# https://marimo.${DOMAIN}
 # =============================================================================
 # Marimo is a reactive Python notebook that's reproducible, git-friendly,
 # and deployable as apps. The SQL variant ships DuckDB + Ibis + Polars.
