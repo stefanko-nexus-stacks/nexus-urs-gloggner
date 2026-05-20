@@ -118,21 +118,79 @@ RUN uv venv /opt/nexus-venv && \
       duckdb && \
     chown -R coder:coder /opt/nexus-venv
 
-# Auto-activate nexus-venv via /etc/bash.bashrc (system-wide, IMAGE-BAKED).
-# Bash sources /etc/bash.bashrc for every interactive non-login shell —
-# including the terminal inside code-server. Unlike /home/coder/.bashrc
-# (which lives in the volume-masked /home/coder), /etc/bash.bashrc is
-# always the one shipped with the image, so updates here actually take
-# effect on the next container restart even for existing
-# code-server-data volumes.
-RUN { \
-      echo ''; \
-      echo '# Auto-activate Nexus-Stack pre-installed dbt + notebook venv'; \
-      echo '# (image-baked at /opt/nexus-venv; survives volume-mount masking)'; \
-      echo 'if [ -f /opt/nexus-venv/bin/activate ]; then'; \
-      echo '  . /opt/nexus-venv/bin/activate'; \
-      echo 'fi'; \
-    } >> /etc/bash.bashrc
+# Nexus-venv auto-activation: handled at container-start time by the
+# compose entrypoint (appends the activate-block to ~/.bashrc if not
+# already present). Cannot use /etc/bash.bashrc here because
+# code-server launches its xterm with 'bash --init-file ...' — bash
+# skips /etc/bash.bashrc when given --init-file, and the init-file
+# (VS Code's shellIntegration-bash.sh) sources ~/.bashrc, not
+# /etc/bash.bashrc. The PR #580 strategy of writing to
+# /etc/bash.bashrc never actually triggered in code-server terminals.
+#
+# ~/.bashrc lives in the volume mount (code-server-data:/home/coder),
+# so the activate-block has to be APPENDED at container-start time
+# rather than baked into the image. The entrypoint guard
+# ('grep -q ... || append') makes it idempotent across restarts.
+
+# Pre-stage VS Code extensions for seeding into a fresh
+# code-server-data volume.
+#
+# LOCATION: /opt/code-server-extensions (NOT /home/coder/.local/share/code-server/extensions).
+# Same rationale as /opt/nexus-venv above: docker-compose mounts
+# code-server-data:/home/coder, so anything baked directly into
+# /home/coder/<X> is MASKED by the volume on every container start.
+#
+# Strategy: bake the extensions into /opt/ at image-build time,
+# then have the compose entrypoint copy them into the default user
+# extension dir (~/.local/share/code-server/extensions/) when BOTH
+# (a) the user dir is empty AND (b) /opt/ has content. After a
+# successful seed, the user dir is the authoritative location for
+# both baked AND user-installed extensions:
+#
+# - Both kinds live in the volume → user installs are persisted
+#   across container recreate and image rebuilds.
+# - code-server runs WITHOUT --extensions-dir, so the default
+#   directory is used (no read/write split).
+# - Volumes with user-installed extensions are never re-seeded
+#   (the empty-check skips the copy) — preserves user state across
+#   image rebuilds.
+# - Volumes with an empty user dir (no installs yet) DO get the
+#   seed when /opt/ has content. So if /opt/ is empty today (#593
+#   state) and a future image adds a baked extension, deployments
+#   that haven't installed anything yet pick it up automatically;
+#   deployments that already have extensions in the volume don't.
+#   That's a deliberate trade-off: protect user state, but stay
+#   permissive for genuinely-empty volumes so a future baked
+#   extension reaches vanilla deployments.
+#
+# No extensions are currently baked. The infrastructure is kept so
+# adding one later is a single line after the USER coder switch below:
+#   RUN code-server --extensions-dir /opt/code-server-extensions \
+#         --install-extension <id>
+# The --extensions-dir flag is mandatory — without it, install-extension
+# lands the extension in the default ~/.local/share/code-server/extensions/
+# which gets masked by the code-server-data volume mount on container
+# start, so the extension disappears on first run. SQLTools + sqltools-driver-pg
+# were pre-installed in #588 but removed again: every SQL-Tools-style
+# extension (SQLTools, cweijan database-client, …) breaks in the
+# code-server-through-CF-Tunnel setup. SQLTools' "Add New Connection"
+# panel renders blank (coder/code-server#7302, "wontfix" upstream);
+# cweijan's query/result page is blank because the extension spins up
+# a localhost helper server on :12315 that the browser-side webview
+# can't reach without remote-port-forwarding (cweijan #373, also
+# unfixed). Students who need a SQL GUI use pgAdmin or CloudBeaver
+# (separate stacks with proper web UIs) instead.
+RUN mkdir -p /opt/code-server-extensions && \
+    chown -R coder:coder /opt/code-server-extensions
+
+# Migration scripts called from the compose entrypoint. Currently
+# only the one-time #593 sqltools-settings cleanup (atomic temp-file +
+# rename rewrite of settings.json to strip leftover credential keys).
+# Kept in /opt/ — outside the code-server-data volume mount that
+# masks /home/coder/ — so the script is reachable on every container
+# start regardless of volume state.
+COPY scripts/ /opt/code-server-scripts/
+RUN chmod -R a+r /opt/code-server-scripts
 
 USER coder
 

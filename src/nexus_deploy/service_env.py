@@ -394,11 +394,25 @@ SELECT pg_reload_conf();
 
 
 def _render_pgadmin(c: NexusConfig, e: BootstrapEnv) -> RenderedEnv:
+    """pgAdmin .env + a sidecar ``pgpass`` file consumed by the
+    pre-configured Nexus PostgreSQL server (servers.json references
+    ``PassFile: /pgpass``).
+
+    Format is the standard libpq pgpass: ``host:port:db:user:password``.
+    Written 0o644 (not 0o600) because the file is owned by the
+    deploy-runner user but read inside the container by the
+    ``pgadmin`` user (uid 5050) — libpq's 0o600 check doesn't
+    apply because pgAdmin uses the PassFile via its own loader,
+    not libpq. The file lives at /opt/docker-server/stacks/pgadmin/
+    on the host, only reachable via SSH (CF Tunnel + key auth).
+    """
+    pgpass_content = f"postgres:5432:postgres:nexus-postgres:{c.postgres_password or ''}\n"
     return RenderedEnv(
         env_vars={
             "ADMIN_EMAIL": e.admin_email or "",
             "PGADMIN_PASSWORD": c.pgadmin_password or "",
         },
+        sidecars=(SidecarFile(relative_path="pgpass", content=pgpass_content, mode=0o644),),
     )
 
 
@@ -835,24 +849,17 @@ def _render_marimo(c: NexusConfig, e: BootstrapEnv) -> RenderedEnv:
 
 
 def _render_code_server(c: NexusConfig, e: BootstrapEnv) -> RenderedEnv:
-    """code-server: same Gitea-append pattern as Marimo (see _render_marimo).
+    """code-server: Gitea-append pattern (like Marimo).
 
-    The render itself emits no env vars — but its presence in _SPECS is
-    required so ``stacks/code-server/.env`` gets created (even if empty).
-    Without that file, :func:`append_gitea_workspace_block` sees
-    ``not env_path.exists()`` and silently skips, leaving code-server
-    with no ``GITEA_REPO_URL`` / ``GITEA_USERNAME`` / ``GITEA_PASSWORD`` /
-    ``REPO_NAME`` — the container's entrypoint then can't write the
-    .netrc + clone the workspace repo into /home/coder/<REPO_NAME>,
-    and students see only the bare home dir in the file tree.
-
-    Same bug class as the Marimo fix in commit fb586ab; the lesson there
-    transfers verbatim — every _GITEA_APPEND_TARGETS entry needs an
-    _SPECS entry, even if the render function returns no vars.
+    The ``.env`` file is unconditionally created so
+    :func:`append_gitea_workspace_block` can append the Gitea workspace
+    block — same bug-class fix as the Marimo placeholder (commit
+    fb586ab). Without the .env file, the Gitea-append step silently
+    skips and the entrypoint can't clone the workspace repo.
 
     All other code-server config lives in the docker-compose.yml's
-    entrypoint (clone logic, --auth flags) or in the image (dbt venv,
-    DuckDB CLI). Nothing else to render here.
+    entrypoint (clone logic, --auth flag, extension-seed-on-first-start
+    copy) or in the image (dbt venv, DuckDB CLI).
     """
     del c, e  # no derived vars
     return RenderedEnv(env_vars={})
@@ -939,14 +946,17 @@ def _render_dify(c: NexusConfig, e: BootstrapEnv) -> RenderedEnv:
 # ---------------------------------------------------------------------------
 
 
-# Wrappers for cross-spec dependencies. The jupyter spec needs to
-# know whether spark is in the enabled list, so its render function
-# is created at run-time inside render_all_env_files where the list
-# is in scope. The placeholder here lets us list it in _SPECS for
-# ordering; the actual render happens via a closure below.
+# Wrapper for cross-spec dependencies. Jupyter needs the spark-enabled
+# flag, which can't be baked into a static EnvSpec because it depends
+# on which OTHER stacks the operator has enabled. The placeholder sits
+# in _SPECS for ordering; the real render is invoked via the
+# cross-spec branch inside render_all_env_files below.
 def _placeholder_jupyter(c: NexusConfig, e: BootstrapEnv) -> RenderedEnv:
-    """Replaced at runtime — see render_all_env_files."""
-    raise NotImplementedError("jupyter render is closure-built per-deploy")
+    """Never invoked at runtime — see render_all_env_files."""
+    raise NotImplementedError(
+        "jupyter render needs spark_enabled context; should be dispatched via "
+        "the cross-spec branch in render_all_env_files, not via this placeholder",
+    )
 
 
 _SPECS: tuple[EnvSpec, ...] = (
@@ -1069,7 +1079,7 @@ def render_all_env_files(
             )
             continue
 
-        # Special-case: jupyter render needs spark_enabled context.
+        # Cross-spec dependencies: jupyter needs spark_enabled.
         if spec.service_name == "jupyter":
             rendered = _render_jupyter(config, env, spark_enabled=spark_enabled)
         else:
